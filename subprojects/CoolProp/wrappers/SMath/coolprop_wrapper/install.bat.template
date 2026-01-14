@@ -1,0 +1,4 @@
+
+set VERSION=${COOLPROP_VERSION}
+xcopy %VERSION% %AppData%\SMath\extensions\plugins\ca92ef03-c7da-4888-98ad-528482733e2f\%VERSION%\ /S
+xcopy config.ini %AppData%\SMath\extensions\plugins\ca92ef03-c7da-4888-98ad-528482733e2f\config.ini

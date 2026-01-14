@@ -1,0 +1,21 @@
+BasedOnStyle: Google
+
+AlignTrailingComments: true
+AllowShortBlocksOnASingleLine: Empty
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AttributeMacros: ['CODI_Likely', 'CODI_Unlikely']
+BreakBeforeBraces: Attach
+ColumnLimit: 120
+EmptyLineAfterAccessModifier: Leave
+FixNamespaceComments: false
+IndentCaseLabels: true
+IndentPPDirectives: BeforeHash
+IndentWidth: 2
+IndentAccessModifiers: true
+MaxEmptyLinesToKeep: 1
+NamespaceIndentation: All
+PenaltyBreakComment: 100
+SpaceAfterTemplateKeyword: false

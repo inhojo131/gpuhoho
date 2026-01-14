@@ -1,0 +1,31 @@
+name: Test Suite
+
+on:
+  push:
+    branches:
+      - 'develop'
+      - 'master'
+  pull_request:
+    branches: 
+      - 'develop'
+      - 'master'
+
+jobs:
+  Tests:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+    - name: Install clang
+      run: |
+        sudo apt update
+        sudo apt install -y clang
+        sudo apt install libomp-dev
+    - name: General Tests
+      run: |
+        cd tests/general/
+        make CXX=clang++
+    - name: Event Tests
+      run: |
+        cd tests/events/
+        make CXX=clang++
+

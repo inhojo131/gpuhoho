@@ -1,0 +1,12 @@
+common_src += files(['CBoxMeshReaderFEM.cpp',
+                     'CBoxMeshReaderFVM.cpp',
+                     'CCGNSElementType.cpp',
+                     'CCGNSMeshReaderBase.cpp',
+                     'CCGNSMeshReaderFEM.cpp',
+                     'CCGNSMeshReaderFVM.cpp',
+                     'CMeshReaderBase.cpp',
+                     'CRectangularMeshReaderFEM.cpp',
+                     'CRectangularMeshReaderFVM.cpp',
+                     'CSU2ASCIIMeshReaderBase.cpp',
+                     'CSU2ASCIIMeshReaderFEM.cpp',
+                     'CSU2ASCIIMeshReaderFVM.cpp'])

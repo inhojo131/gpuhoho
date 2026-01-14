@@ -1,0 +1,18 @@
+p.formulaDsp {
+	text-align: left;
+  text-indent: 2em;
+}
+
+.navpath li.footer {
+  float: unset;
+}
+
+.alignleft {
+    float: left;
+}
+.alignright {
+    float: right;
+}
+
+h1 { font-size: 120%; }
+h2 { font-size: 110%; }

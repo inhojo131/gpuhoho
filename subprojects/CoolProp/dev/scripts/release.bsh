@@ -1,0 +1,213 @@
+#!/bin/bash
+##############################################
+# CoolProp release management
+##############################################
+#
+# Things to remember when you make a new release:
+#
+#  * Force a new build on all buildbots from the release branch
+#  * Run the script and check the logs
+#  * Make a tag in your git software
+#  * Update the default download on sourceforge to point to the new sources
+#
+# In case you experience problems with permissions, login to
+# sourceforge by creating a new shell with
+# ssh -t username,coolprop@shell.sf.net create
+# and the run
+# find . -type d ! -perm 0775 -exec chmod 0775 {} \;
+# find . -type f ! -perm 0664 -exec chmod 0664 {} \;
+# in /home/project-web/coolprop/htdocs and /home/frs/project/coolprop/
+# to reset all permissions.
+#
+# Force quit on all errors
+set -e
+#
+# Make sure that only two arguments are passed to this script - the version that
+# will be released and the dryrun vs. release option.
+if [ $# != 2 ]; then
+    echo "Only two arguments should be passed to this script: "
+    echo "The version that will be released and if you would like a dry run or a release."
+    echo "for example: \"release.bsh 5.0.0 dryrun\" or \"release.bsh nightly release\" "
+    exit 1
+fi
+#
+# Just a small function print messages
+SEPARATOR="---------------------------------------------------"
+function printMessage {
+    echo " "
+    echo $SEPARATOR
+    echo "$1"
+    echo $SEPARATOR
+    return 0
+}
+#
+rm -f release.bsh.cmds.txt
+function runCommand {
+    echo "Running command: ${@}"
+    echo "${@}" >> release.bsh.cmds.txt
+    case "${1}" in
+        "echo")  eval ${@};;
+        "cd")    eval ${@};;
+        "pushd") eval ${@};;
+        "popd")  eval ${@};;
+        "")      echo "undefined command";;
+        #*)       echo "no action";;
+        *)       eval ${@};;
+    esac
+}
+# Process the version number and set parameters accordingly
+CPVERSION="$1"
+if [[ $CPVERSION == +([0-9]).+([0-9]).+([0-9]) ]]; then
+    BINFOLDER="release"
+elif [ "$CPVERSION" == "nightly" ]; then
+    BINFOLDER="binaries"
+else
+    echo "CPVERSION = $CPVERSION - not valid!"
+    exit 1
+fi
+# Process the dryrun option
+if [ "$2" == "release" ]; then
+    DRYRUN=false
+else
+    DRYRUN=true
+fi
+#
+printMessage "Detected parameters"
+echo "CPVERSION = $CPVERSION - which is a valid input"
+echo "DRYRUN    = $DRYRUN"
+echo "BINFOLDER = $BINFOLDER"
+#
+#
+SFUSER="jorritw" # ibell or jorritw
+# Absolute (!) paths -> XXXXDIR
+BASEDIR="$HOME/buildbot/server-master/public_html"
+REPODIR="$HOME/src/CoolPropFull.git"
+TMPSDIR="$HOME/src/CoolProp.sources"
+SRCSDIR="$BASEDIR/$BINFOLDER/source"
+COVEDIR="$HOME/src/CoolPropCoverity.git"
+#
+# Relative (!) paths -> XXXFOLDER
+DOCFOLDER="$BINFOLDER/docs"
+SPHFOLDER="$BINFOLDER/sphinx"
+DOC4FILES="4.2.5/coolpropv425docs.zip"
+DOC4FOLDER="$SPHFOLDER/v4"
+RSYNC_EXCL="--exclude=sphinx --exclude=shared_library/Linux"
+#
+DOCFILE="documentation.zip"
+#
+#
+if [ "$DRYRUN" != "false" ]; then
+    printMessage "Dry run detected"
+    echo "Dry run; no zipping of the sources"
+    echo "Dry run; no zipping of the docs"
+    echo "Dry run; skipping python upload"
+    RSYNC_DRY_RUN=--dry-run
+else
+    RSYNC_DRY_RUN=
+    ######################################
+    # We start with the absolute paths ...
+    ######################################
+    runCommand mkdir -p "$TMPSDIR" "$SRCSDIR" # Generating directories
+    printMessage "Updating sources"
+    runCommand pushd "$REPODIR"
+    runCommand find . -type d ! -perm -a+rx -exec chmod -v a+rx {} \\\;
+    runCommand find . -type f ! -perm -a+r -exec chmod -v a+r {} \\\;
+    runCommand git clean -xfd
+    runCommand git reset --hard
+    runCommand git submodule foreach --recursive git clean -xfd
+    runCommand git submodule foreach --recursive git reset --hard
+    runCommand git checkout -B master origin/master
+    runCommand git pull
+    runCommand git submodule update --init --recursive
+    runCommand popd
+    printMessage "Generating headers"
+    runCommand rsync -a --delete "$REPODIR/" "$TMPSDIR"
+    runCommand pushd "$TMPSDIR"
+    runCommand git reset --hard HEAD
+    runCommand python "dev/generate_headers.py"
+    runCommand find . -iwholename \"*/.git*\" -prune -exec rm -rf {} \\\;
+    runCommand cd ..
+    runCommand rm -f $SRCSDIR/CoolProp_sources.zip
+    runCommand zip -rq $SRCSDIR/CoolProp_sources.zip $(basename $TMPSDIR)
+    runCommand cd $(basename $TMPSDIR)
+    runCommand popd
+    printMessage "Avoid security warnings caused by commands in externals/pybind11/docs/benchmark.py"
+    runCommand rm "$REPODIR"/externals/pybind11/docs/benchmark.py
+    runCommand rm "$TMPSDIR"/externals/pybind11/docs/benchmark.py
+    ######################################
+    # ... and now we use relative paths
+    ######################################
+    runCommand pushd ${BASEDIR}
+    runCommand mkdir -p \"$DOCFOLDER\" \"$SPHFOLDER\" \"$DOC4FOLDER\"
+    printMessage "Preparing the docs and moving them into the $BINFOLDER folder for staging"
+    runCommand rsync $RSYNC_DRY_RUN $RSYNC_OPTS \"frs.sf.net-$SFUSER:/home/frs/project/coolprop/CoolProp/$DOC4FILES\" \"$(basename $DOC4FILES)\"
+    runCommand unzip -qo \"$(basename $DOC4FILES)\" -d \"$DOC4FOLDER\"
+    runCommand zip -rq \"$DOCFILE\" $SPHFOLDER/* -x */$(basename $DOC4FOLDER)/*
+    runCommand mv \"$DOCFILE\" \"$DOCFOLDER\"
+    #
+    if [ "$CPVERSION" == "nightly" ]; then
+        printMessage "Detected nightly release, updating README.rst.txt"
+        echo    "CoolProp nightly binaries"   >  "$BINFOLDER/README.rst.txt"
+        echo    "-------------------------"   >> "$BINFOLDER/README.rst.txt"
+        echo -n "Development binaries of the" >> "$BINFOLDER/README.rst.txt"
+        echo -n " \`CoolProp project <http://coolprop.sourceforge.net>\`_ " >> "$BINFOLDER/README.rst.txt"
+        echo    "updated on $(date +%F) at $(date +%X) $(date +%Z)." >> "$BINFOLDER/README.rst.txt"
+        RSYNC_OPTS="-a --chmod=Dug=rwx,Do=rx,Fug=rw,Fo=r -z --stats --delete"
+        #for i in {1..2}; do for j in $BINFOLDER/Python/*.tar.gz; do binstar upload --force -u coolprop -t pypi -c dev $j; done; done
+        #for i in {1..5}; do for j in $BINFOLDER/Python_conda/*/*.tar.bz2; do binstar upload --force -u coolprop -t conda -c dev $j && rm $j; done; done
+        printMessage "Overwriting the coverity_scan branch with the master branch"
+        runCommand pushd \"$COVEDIR\"
+        runCommand git checkout -B master origin/master
+        runCommand git pull
+        runCommand git push origin +master:coverity_scan
+        runCommand popd
+    else
+        printMessage "Updating README.rst.txt with the full release information"
+        echo    "Welcome to CoolProp's download directory v$CPVERSION"   >  "$BINFOLDER/README.rst.txt"
+        echo    "-----------------------------------------------"   >> "$BINFOLDER/README.rst.txt"
+                cat     "$REPODIR/dev/scripts/release_readme.rst.txt" >> "$BINFOLDER/README.rst.txt"
+        echo    "This README.rst.txt was generated automatically on $(date +%F) at $(date +%X) $(date +%Z)." >> "$BINFOLDER/README.rst.txt"
+        RSYNC_OPTS="-a --chmod=Dug=rwx,Do=rx,Fug=rw,Fo=r -z --stats"
+        printMessage "Detected full release, uploading the python binaries to pypi"
+        runCommand twine upload $BINFOLDER/Python/*.whl $BINFOLDER/Python/*.tar.gz
+        #printMessage "and uploading the python binaries to binstar"
+        #for i in {1..2}; do for j in $BINFOLDER/Python/*.tar.gz; do binstar upload --force -u coolprop -t pypi -c main $j; done; done
+        #for i in {1..5}; do for j in $BINFOLDER/Python_conda/*/*.tar.bz2; do binstar upload --force -u coolprop -t conda -c main $j && rm $j; done; done
+    fi
+    popd
+fi
+######################################
+# ... we continue with relative paths
+######################################
+runCommand pushd ${BASEDIR}
+printMessage "Copying the binaries to SourceForge"
+runCommand rsync $RSYNC_DRY_RUN $RSYNC_OPTS $RSYNC_EXCL "$BINFOLDER/" frs.sf.net-$SFUSER:/home/frs/project/coolprop/CoolProp/$CPVERSION
+#
+if [ ${CPVERSION:0:7} != "nightly" ]; then
+    printMessage "Publishing the docs on SourceForge"
+    runCommand rsync $RSYNC_DRY_RUN $RSYNC_OPTS \"$SPHFOLDER/\" frs.sf.net-$SFUSER:/home/project-web/coolprop/htdocs
+    printMessage "Updating the default Javascript library on SourceForge"
+    runCommand pushd \"$BINFOLDER/Javascript/\"
+    runCommand cp coolprop.js \"coolprop-${CPVERSION}.js\"
+    runCommand cp coolprop.wasm \"coolprop-${CPVERSION}.wasm\"
+    runCommand rsync $RSYNC_DRY_RUN $RSYNC_OPTS coolprop.js \"coolprop-${CPVERSION}.js\" coolprop.wasm \"coolprop-${CPVERSION}.wasm\" index.html frs.sf.net-$SFUSER:/home/project-web/coolprop/htdocs/jscript/
+    runCommand popd
+else
+    printMessage "Publishing the development docs on SourceForge"
+    runCommand rsync $RSYNC_DRY_RUN $RSYNC_OPTS \"$SPHFOLDER/\" frs.sf.net-$SFUSER:/home/project-web/coolprop/htdocs/dev
+fi
+#
+if [[ ("$BINFOLDER" == "release") && ("$DRYRUN" == "false") ]]; then
+    printMessage "Removing release directory"
+    runCommand rm -rf "release"
+    runCommand mkdir -p "release"
+    printMessage "Removing binaries directory to clean the nightly builds"
+    runCommand rm -rf "binaries"
+    runCommand mkdir -p "binaries"
+    printMessage "Removing unstable directory to clean the custom builds"
+    runCommand rm -rf "unstable"
+    runCommand mkdir -p "unstable"
+fi
+runCommand popd
+printMessage "All done, goodbye."
+exit 0
