@@ -99,8 +99,6 @@
 #include "../../../Common/include/grid_movement/CVolumetricMovementFactory.hpp"
 
 #include <cassert>
-#include <vector>
-
 #ifdef VTUNEPROF
 #include <ittnotify.h>
 #endif
@@ -138,7 +136,6 @@ CDriverBase(confFile, val_nZone, MPICommunicator), StopCalc(false), fsi(false), 
     nInst[iZone] = config_container[iZone]->GetnTimeInstances();
 
     geometry_container[iZone]    = new CGeometry**    [nInst[iZone]] ();
-    gpu_geometry_container[iZone] = new GeometryGPU* [nInst[iZone]] ();
     iteration_container[iZone]   = new CIteration*    [nInst[iZone]] ();
     solver_container[iZone]      = new CSolver***     [nInst[iZone]] ();
     integration_container[iZone] = new CIntegration** [nInst[iZone]] ();
@@ -153,7 +150,6 @@ CDriverBase(confFile, val_nZone, MPICommunicator), StopCalc(false), fsi(false), 
     for (iInst = 0; iInst < nInst[iZone]; iInst++) {
 
       config_container[iZone]->SetiInst(iInst);
-      gpu_geometry_container[iZone][iInst] = nullptr;
 
       /*--- Preprocessing of the geometry for all zones. In this routine, the edge-
        based data structure is constructed, i.e. node and cell neighbors are
@@ -219,14 +215,6 @@ CDriverBase(confFile, val_nZone, MPICommunicator), StopCalc(false), fsi(false), 
       /*--- Static mesh processing.  ---*/
 
       PreprocessStaticMesh(config_container[iZone], geometry_container[iZone][iInst]);
-
-      /*--- Optional: upload geometry buffers to GPU (no-op if not enabled). ---*/
-      if (config_container[iZone]->GetCUDA()) {
-        const auto kindSolver = config_container[iZone]->GetKind_Solver();
-        if (kindSolver == MAIN_SOLVER::EULER || kindSolver == MAIN_SOLVER::NAVIER_STOKES) {
-          UploadGeometryToGPU(geometry_container[iZone][iInst], gpu_geometry_container[iZone][iInst]);
-        }
-      }
 
     }
 
@@ -326,7 +314,6 @@ void CDriver::InitializeContainers(){
   FFDBox                         = nullptr;
   interface_container            = nullptr;
   interface_types                = nullptr;
-  gpu_geometry_container         = nullptr;
   nInst                          = nullptr;
 
   /*--- Definition and of the containers for all possible zones. ---*/
@@ -344,7 +331,6 @@ void CDriver::InitializeContainers(){
   interface_container            = new CInterface**[nZone] ();
   interface_types                = new unsigned short*[nZone] ();
   output_container               = new COutput*[nZone] ();
-  gpu_geometry_container         = new GeometryGPU**[nZone] ();
   nInst                          = new unsigned short[nZone] ();
   driver_config                  = nullptr;
   driver_output                  = nullptr;
@@ -352,7 +338,6 @@ void CDriver::InitializeContainers(){
   for (iZone = 0; iZone < nZone; iZone++) {
     interface_types[iZone] = new unsigned short[nZone];
     nInst[iZone] = 1;
-    gpu_geometry_container[iZone] = nullptr;
   }
 
 }
@@ -443,19 +428,11 @@ void CDriver::Finalize() {
         for (unsigned short iMGlevel = 0; iMGlevel < config_container[iZone]->GetnMGLevels()+1; iMGlevel++)
           delete geometry_container[iZone][iInst][iMGlevel];
         delete [] geometry_container[iZone][iInst];
-        if (gpu_geometry_container[iZone] != nullptr && gpu_geometry_container[iZone][iInst] != nullptr) {
-          gpu_geometry_container[iZone][iInst]->Free();
-          delete gpu_geometry_container[iZone][iInst];
-        }
       }
       delete [] geometry_container[iZone];
-      if (gpu_geometry_container[iZone] != nullptr) {
-        delete [] gpu_geometry_container[iZone];
-      }
     }
   }
   delete [] geometry_container;
-  delete [] gpu_geometry_container;
   if (rank == MASTER_NODE) cout << "Deleted CGeometry container." << endl;
 
   for (iZone = 0; iZone < nZone; iZone++) {
@@ -3656,16 +3633,4 @@ void CHBDriver::ComputeHBOperator() {
   delete [] Dcpx;
   delete [] Omega_HB;
 
-}
-
-/*--- GPU geometry upload stub: prepares contiguous buffers and copies to device. ---*/
-void CDriver::UploadGeometryToGPU(CGeometry** geometry, GeometryGPU*& gpu_geom) const {
-#ifdef HAVE_CUDA
-  /* Not implemented: the current geometry interface does not expose point/edge
-     accessors needed here. Stubbed out to allow GPU-enabled builds to compile. */
-  (void)geometry;
-  (void)gpu_geom;
-#else
-  (void)geometry; (void)gpu_geom;
-#endif
 }

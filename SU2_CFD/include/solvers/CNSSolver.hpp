@@ -172,6 +172,31 @@ public:
                     bool Output) override;
 
   /*!
+   * \brief Explicit Euler iteration with optional GPU node update.
+   */
+  void ExplicitEuler_Iteration(CGeometry *geometry, CSolver **solver_container, CConfig *config) override;
+
+  /*!
+   * \brief Compute residuals using an upwind scheme.
+   */
+  void Upwind_Residual(CGeometry *geometry, CSolver **solver_container, CNumerics **numerics_container,
+                       CConfig *config, unsigned short iMesh) override;
+
+  /*!
+   * \brief Boundary conditions that may be handled on GPU.
+   */
+  void BC_Far_Field(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                    CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) override;
+  void BC_Inlet(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) override;
+  void BC_Outlet(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                 CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) override;
+  void BC_Sym_Plane(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                    CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) override;
+  void BC_Euler_Wall(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                     CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) override;
+
+  /*!
    * \brief Compute weighted-sum "combo" objective output
    * \param[in] config - Definition of the particular problem.
    * \param[in] solver - Container vector with all the solutions.

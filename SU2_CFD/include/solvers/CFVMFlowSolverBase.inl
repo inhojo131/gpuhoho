@@ -32,9 +32,6 @@
 #include "../numerics_simd/CNumericsSIMD.hpp"
 #include "CFVMFlowSolverBase.hpp"
 #include <cmath>
-#ifdef HAVE_CUDA
-#include "aero_coeffs_cuda.h"
-#endif
 
 template <class V, ENUM_REGIME R>
 void CFVMFlowSolverBase<V, R>::AeroCoeffsArray::allocate(int size) {
@@ -434,10 +431,6 @@ void CFVMFlowSolverBase<V, R>::SetPrimitive_Limiter(CGeometry* geometry, const C
 template <class V, ENUM_REGIME R>
 void CFVMFlowSolverBase<V, R>::Viscous_Residual_impl(unsigned long iEdge, CGeometry *geometry, CSolver **solver_container,
                                                      CNumerics *numerics, CConfig *config) {
-
-  if (ReducerStrategy && config->GetCUDA() && config->GetCUDAViscousFlux()) {
-    return;
-  }
 
   const bool implicit  = (config->GetKind_TimeIntScheme() == EULER_IMPLICIT);
   const bool tkeNeeded = (config->GetKind_Turb_Model() == TURB_MODEL::SST);
@@ -1581,194 +1574,7 @@ void CFVMFlowSolverBase<V, R>::EdgeFluxResidual(const CGeometry *geometry,
 
 template <class V, ENUM_REGIME R>
 void CFVMFlowSolverBase<V, R>::SumEdgeFluxes(const CGeometry* geometry, const CConfig* config) {
-
-#ifdef HAVE_CUDA
-  const bool use_gpu_sum = config && config->GetCUDA();
-  bool use_gpu_viscous = use_gpu_sum && config->GetCUDAViscousFlux() && config->GetViscous();
-  if (use_gpu_viscous && config->GetSSTParsedOptions().uq) {
-    use_gpu_viscous = true;
-  }
-  if (use_gpu_viscous && edgeNumerics) {
-    // SIMD edge numerics already include viscous contributions.
-    use_gpu_viscous = true;
-  }
-
-  if (use_gpu_sum) {
-    const unsigned long nPoint = geometry->GetnPoint();
-    const unsigned long nEdge  = geometry->GetnEdge();
-    const unsigned short nVar  = this->nVar;
-    const unsigned short nDim  = geometry->GetnDim();
-    const unsigned short nPrim = static_cast<unsigned short>(nPrimVar);
-    const unsigned short nGradPrim = static_cast<unsigned short>(nDim + 1);
-
-    // 1) 호스트 평탄화
-    std::vector<unsigned long> h_off(nPoint + 1, 0), h_edges;
-    h_edges.reserve(nEdge);
-    for (unsigned long p = 0; p < nPoint; ++p) {
-      for (auto e : geometry->nodes->GetEdges(p)) h_edges.push_back(e);
-      h_off[p + 1] = h_edges.size();
-    }
-    std::vector<unsigned long> h_e0(nEdge), h_e1(nEdge);
-    for (unsigned long e = 0; e < nEdge; ++e) {
-      h_e0[e] = geometry->edges->GetNode(e, 0);
-      h_e1[e] = geometry->edges->GetNode(e, 1);
-    }
-    std::vector<double> h_flux(nEdge * nVar, 0.0);
-
-    if (use_gpu_viscous) {
-      const bool correct_gradient = (MGLevel == MESH_0);
-      const bool qcr = config->GetSAParsedOptions().qcr2000;
-      const su2double gamma = config->GetGamma();
-      const su2double gas = config->GetGas_Constant();
-      const su2double pr_lam = config->GetPrandtl_Lam();
-      const su2double pr_turb = config->GetPrandtl_Turb();
-      const su2double cp = gamma / (gamma - su2double(1.0)) * gas;
-
-      std::vector<double> h_normal(3 * nEdge, 0.0), h_area(nEdge, 0.0);
-      std::vector<double> h_prim(static_cast<size_t>(nEdge) * nPrim, 0.0);
-      std::vector<double> h_grad(static_cast<size_t>(nEdge) * nGradPrim * 3u, 0.0);
-      std::vector<double> h_mu_lam(nEdge, 0.0), h_mu_turb(nEdge, 0.0);
-      std::vector<double> h_kappa(nEdge, 0.0), h_tau_wall(nEdge, 0.0);
-      std::vector<double> h_visc(nEdge * nVar, 0.0);
-
-      for (unsigned long e = 0; e < nEdge; ++e) {
-        const double* blk = EdgeFluxes.GetBlock(e);
-        std::copy(blk, blk + nVar, h_flux.data() + e * nVar);
-      }
-
-      for (unsigned long e = 0; e < nEdge; ++e) {
-        const auto iPoint = h_e0[e];
-        const auto jPoint = h_e1[e];
-        const su2double* prim_i = nodes->GetPrimitive(iPoint);
-        const su2double* prim_j = nodes->GetPrimitive(jPoint);
-
-        for (unsigned short v = 0; v < nPrim; ++v) {
-          h_prim[static_cast<size_t>(e) * nPrim + v] =
-              0.5 * (prim_i[v] + prim_j[v]);
-        }
-
-        const auto& grad_i = nodes->GetGradient_Primitive(iPoint);
-        const auto& grad_j = nodes->GetGradient_Primitive(jPoint);
-        for (unsigned short v = 0; v < nGradPrim; ++v) {
-          for (unsigned short d = 0; d < nDim; ++d) {
-            const size_t idx = (static_cast<size_t>(e) * nGradPrim + v) * 3u + d;
-            h_grad[idx] = 0.5 * (grad_i[v][d] + grad_j[v][d]);
-          }
-        }
-
-        if (correct_gradient) {
-          su2double edge_vec[MAXNDIM] = {0.0, 0.0, 0.0};
-          su2double dist2 = 0.0;
-          const su2double* coord_i = geometry->nodes->GetCoord(iPoint);
-          const su2double* coord_j = geometry->nodes->GetCoord(jPoint);
-          for (unsigned short d = 0; d < nDim; ++d) {
-            edge_vec[d] = coord_j[d] - coord_i[d];
-            dist2 += edge_vec[d] * edge_vec[d];
-          }
-          if (dist2 != 0.0) {
-            for (unsigned short v = 0; v < nGradPrim; ++v) {
-              su2double proj = 0.0;
-              for (unsigned short d = 0; d < nDim; ++d) {
-                const size_t idx = (static_cast<size_t>(e) * nGradPrim + v) * 3u + d;
-                proj += h_grad[idx] * edge_vec[d];
-              }
-              const su2double delta = prim_j[v] - prim_i[v];
-              for (unsigned short d = 0; d < nDim; ++d) {
-                const size_t idx = (static_cast<size_t>(e) * nGradPrim + v) * 3u + d;
-                h_grad[idx] -= (proj - delta) * edge_vec[d] / dist2;
-              }
-            }
-          }
-        }
-
-        const su2double* normal = geometry->edges->GetNormal(e);
-        su2double area = 0.0;
-        for (unsigned short d = 0; d < nDim; ++d) {
-          h_normal[3 * e + d] = normal[d];
-          area += normal[d] * normal[d];
-        }
-        for (unsigned short d = nDim; d < 3; ++d) {
-          h_normal[3 * e + d] = 0.0;
-        }
-        h_area[e] = sqrt(area);
-
-        const unsigned short mu_idx = static_cast<unsigned short>(nDim + 5);
-        const unsigned short mut_idx = static_cast<unsigned short>(nDim + 6);
-        if (mu_idx < nPrim) {
-          h_mu_lam[e] = prim_i[mu_idx] * 0.5 + prim_j[mu_idx] * 0.5;
-        }
-        if (mut_idx < nPrim) {
-          h_mu_turb[e] = prim_i[mut_idx] * 0.5 + prim_j[mut_idx] * 0.5;
-        }
-        h_kappa[e] = cp * (h_mu_lam[e] / pr_lam + h_mu_turb[e] / pr_turb);
-
-        const su2double tau_i = nodes->GetTau_Wall(iPoint);
-        const su2double tau_j = nodes->GetTau_Wall(jPoint);
-        const bool only_one = (tau_i > 0.0) ^ (tau_j > 0.0);
-        if (only_one) {
-          const su2double ti = (tau_i > 0.0) ? tau_i : 0.0;
-          const su2double tj = (tau_j > 0.0) ? tau_j : 0.0;
-          h_tau_wall[e] = ti + tj;
-        } else {
-          h_tau_wall[e] = 0.0;
-        }
-      }
-
-      ComputeViscousFluxesHostFull(h_e0.data(), h_e1.data(),
-                                   h_normal.data(), h_area.data(),
-                                   h_mu_lam.data(), h_mu_turb.data(),
-                                   h_kappa.data(), h_prim.data(),
-                                   h_grad.data(), h_tau_wall.data(),
-                                   h_grad.size(),
-                                   nEdge, nVar, nPrim, nGradPrim, nDim,
-                                   qcr ? 1 : 0,
-                                   h_visc.data(), 0);
-
-      for (unsigned long e = 0; e < nEdge; ++e) {
-        double* dst = h_flux.data() + e * nVar;
-        const double* src = h_visc.data() + e * nVar;
-        for (unsigned short v = 0; v < nVar; ++v) dst[v] += src[v];
-      }
-    } else {
-      /* Default: use already-computed edge fluxes from CPU path. */
-      for (unsigned long e = 0; e < nEdge; ++e) {
-        const double* blk = EdgeFluxes.GetBlock(e);
-        std::copy(blk, blk + nVar, h_flux.data() + e * nVar);
-      }
-    }
-
-    // 2) 디바이스 할당/업로드
-    unsigned long *d_off = nullptr, *d_edges = nullptr, *d_e0 = nullptr, *d_e1 = nullptr;
-    double *d_flux = nullptr, *d_res = nullptr;
-    cudaMalloc(&d_off,   (nPoint + 1) * sizeof(unsigned long));
-    cudaMalloc(&d_edges, h_edges.size() * sizeof(unsigned long));
-    cudaMalloc(&d_e0,    nEdge * sizeof(unsigned long));
-    cudaMalloc(&d_e1,    nEdge * sizeof(unsigned long));
-    cudaMalloc(&d_flux,  nEdge * nVar * sizeof(double));
-    cudaMalloc(&d_res,   nPoint * nVar * sizeof(double));
-    cudaStream_t stream = 0;
-    cudaMemcpyAsync(d_off,   h_off.data(),   (nPoint + 1) * sizeof(unsigned long), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_edges, h_edges.data(), h_edges.size() * sizeof(unsigned long), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_e0,    h_e0.data(),    nEdge * sizeof(unsigned long), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_e1,    h_e1.data(),    nEdge * sizeof(unsigned long), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_flux,  h_flux.data(),  nEdge * nVar * sizeof(double), cudaMemcpyHostToDevice, stream);
-
-    // 3) 커널 호출
-    SumEdgeFluxesGPU(d_off, d_edges, d_e0, d_e1, d_flux, d_res, nPoint, nVar, stream);
-
-    // 4) 결과 회수 후 LinSysRes에 반영
-    std::vector<double> h_res(nPoint * nVar);
-    cudaMemcpyAsync(h_res.data(), d_res, nPoint*nVar*sizeof(double), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    for (unsigned long p = 0; p < nPoint; ++p) {
-      LinSysRes.SetBlock(p, h_res.data() + p * nVar);
-    }
-
-    // 5) 해제
-    cudaFree(d_off); cudaFree(d_edges); cudaFree(d_e0); cudaFree(d_e1); cudaFree(d_flux); cudaFree(d_res);
-    return; // GPU 경로 끝
-  }
-#endif  /* HAVE_CUDA */
+  (void)config;
 
   SU2_OMP_FOR_STAT(omp_chunk_size)
   for (unsigned long iPoint = 0; iPoint < nPoint; ++iPoint) {

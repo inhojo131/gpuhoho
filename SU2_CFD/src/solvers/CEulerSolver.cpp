@@ -38,6 +38,8 @@
 #include "../../include/limiters/CLimiterDetails.hpp"
 #include "../../include/output/CTurboOutput.hpp"
 
+#include <vector>
+
 
 CEulerSolver::CEulerSolver(CGeometry *geometry, CConfig *config,
                            unsigned short iMesh, const bool navier_stokes) :
@@ -361,12 +363,6 @@ CEulerSolver::CEulerSolver(CGeometry *geometry, CConfig *config,
 
 CEulerSolver::~CEulerSolver() {
 
-#ifdef HAVE_CUDA
-  if (gpu_state_) {
-    DestroyEulerSolverGPU(gpu_state_);
-    gpu_state_ = nullptr;
-  }
-#endif
   for(auto& model : FluidModel) delete model;
 }
 
@@ -1772,6 +1768,24 @@ void CEulerSolver::Upwind_Residual(CGeometry *geometry, CSolver **solver_contain
   const bool ideal_gas = (config->GetKind_FluidModel() == STANDARD_AIR) ||
                          (config->GetKind_FluidModel() == IDEAL_GAS);
   const bool low_mach_corr = config->Low_Mach_Correction();
+  const bool implicit = (config->GetKind_TimeIntScheme() == EULER_IMPLICIT);
+  const bool muscl = (config->GetMUSCL_Flow() && (iMesh == MESH_0));
+  const bool limiter = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
+  const bool is_explicit_euler = (config->GetKind_TimeIntScheme() == EULER_EXPLICIT);
+  /* GPU path: 1st-order Roe, inviscid, explicit, no reconstruction/limiters. */
+  const bool use_gpu_update = config->GetCUDA() &&
+                              (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
+                              ideal_gas && !low_mach_corr &&
+                              !dynamic_grid && !config->GetViscous() &&
+                              is_explicit_euler && !ReducerStrategy &&
+                              !muscl && !limiter &&
+                              !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint();
+
+#ifdef HAVE_CUDA
+  if (use_gpu_update) {
+    return;
+  }
+#endif
 
   /*--- Use vectorization if the scheme supports it. ---*/
   if (config->GetKind_Upwind_Flow() == UPWIND::ROE && ideal_gas && !low_mach_corr) {
@@ -1779,13 +1793,9 @@ void CEulerSolver::Upwind_Residual(CGeometry *geometry, CSolver **solver_contain
     return;
   }
 
-  const bool implicit         = (config->GetKind_TimeIntScheme() == EULER_IMPLICIT);
-
   const bool roe_turkel       = (config->GetKind_Upwind_Flow() == UPWIND::TURKEL);
   const auto kind_dissipation = config->GetKind_RoeLowDiss();
 
-  const bool muscl            = (config->GetMUSCL_Flow() && (iMesh == MESH_0));
-  const bool limiter          = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
   const bool van_albada       = (config->GetKind_SlopeLimit_Flow() == LIMITER::VAN_ALBADA_EDGE);
 
   /*--- Non-physical counter. ---*/
@@ -2451,6 +2461,113 @@ void CEulerSolver::ClassicalRK4_Iteration(CGeometry *geometry, CSolver **solver_
 }
 
 void CEulerSolver::ExplicitEuler_Iteration(CGeometry *geometry, CSolver **solver_container, CConfig *config) {
+
+  const bool ideal_gas = (config->GetKind_FluidModel() == STANDARD_AIR) ||
+                         (config->GetKind_FluidModel() == IDEAL_GAS);
+  const bool low_mach_corr = config->Low_Mach_Correction();
+  const bool muscl = config->GetMUSCL_Flow();
+  const bool limiter = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
+  const bool use_gpu_update = config->GetCUDA() &&
+                              (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
+                              ideal_gas && !low_mach_corr &&
+                              !dynamic_grid && !config->GetViscous() &&
+                              !ReducerStrategy &&
+                              !muscl && !limiter &&
+                              !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint();
+
+#ifdef HAVE_CUDA
+  if (use_gpu_update) {
+    const unsigned long nPoint = geometry->GetnPoint();
+    const unsigned long nEdge = geometry->GetnEdge();
+    const unsigned long nPointDomain = this->nPointDomain;
+    const unsigned short nDim = geometry->GetnDim();
+    const unsigned short nVar = this->nVar;
+
+    std::vector<unsigned long> h_off(nPoint + 1, 0), h_edges;
+    h_edges.reserve(nEdge);
+    for (unsigned long p = 0; p < nPoint; ++p) {
+      for (auto e : geometry->nodes->GetEdges(p)) h_edges.push_back(e);
+      h_off[p + 1] = h_edges.size();
+    }
+    std::vector<unsigned long> h_e0(nEdge), h_e1(nEdge);
+    for (unsigned long e = 0; e < nEdge; ++e) {
+      h_e0[e] = geometry->edges->GetNode(e, 0);
+      h_e1[e] = geometry->edges->GetNode(e, 1);
+    }
+    std::vector<double> h_normal(static_cast<size_t>(nEdge) * 3, 0.0);
+    for (unsigned long e = 0; e < nEdge; ++e) {
+      const su2double* normal = geometry->edges->GetNormal(e);
+      h_normal[3 * e + 0] = normal[0];
+      h_normal[3 * e + 1] = (nDim > 1) ? normal[1] : 0.0;
+      h_normal[3 * e + 2] = (nDim > 2) ? normal[2] : 0.0;
+    }
+
+    std::vector<double> h_solution(static_cast<size_t>(nPoint) * nVar, 0.0);
+    std::vector<double> h_dt(nPoint, 0.0);
+    std::vector<double> h_volume(nPoint, 0.0);
+    std::vector<double> h_residual_extra(static_cast<size_t>(nPoint) * nVar, 0.0);
+    std::vector<double> h_residual_trunc(static_cast<size_t>(nPoint) * nVar, 0.0);
+
+    for (unsigned long p = 0; p < nPoint; ++p) {
+      const su2double* sol = nodes->GetSolution(p);
+      for (unsigned short v = 0; v < nVar; ++v) {
+        h_solution[static_cast<size_t>(p) * nVar + v] = sol[v];
+      }
+      h_dt[p] = nodes->GetDelta_Time(p);
+      h_volume[p] = geometry->nodes->GetVolume(p) + geometry->nodes->GetPeriodicVolume(p);
+      const su2double* res_extra = LinSysRes.GetBlock(p);
+      const su2double* res_trunc = nodes->GetResTruncError(p);
+      for (unsigned short v = 0; v < nVar; ++v) {
+        h_residual_extra[static_cast<size_t>(p) * nVar + v] = res_extra[v];
+        h_residual_trunc[static_cast<size_t>(p) * nVar + v] = res_trunc[v];
+      }
+    }
+
+    std::vector<double> h_solution_out(static_cast<size_t>(nPoint) * nVar, 0.0);
+    std::vector<double> h_residual_out(static_cast<size_t>(nPoint) * nVar, 0.0);
+
+    AD::StartNoSharedReading();
+    cudaError_t err = ComputeEulerRoeUpdateHost(h_off.data(), h_edges.data(),
+                                                h_e0.data(), h_e1.data(),
+                                                h_normal.data(), h_solution.data(),
+                                                h_dt.data(), h_volume.data(),
+                                                h_residual_extra.data(), h_residual_trunc.data(),
+                                                nPointDomain, nPoint, nEdge, nVar, nDim, Gamma,
+                                                h_solution_out.data(), h_residual_out.data(), 0);
+    if (err != cudaSuccess) {
+      AD::EndNoSharedReading();
+      SU2_MPI::Error("GPU Roe update computation failed.", CURRENT_FUNCTION);
+    }
+
+    SU2_OMP_FOR_STAT(omp_chunk_size)
+    for (unsigned long p = 0; p < nPointDomain; ++p) {
+      for (unsigned short v = 0; v < nVar; ++v) {
+        nodes->SetSolution(p, v, h_solution_out[static_cast<size_t>(p) * nVar + v]);
+      }
+      LinSysRes.SetBlock(p, h_residual_out.data() + p * nVar);
+    }
+    END_SU2_OMP_FOR
+
+    su2double resMax[MAXNVAR] = {0.0}, resRMS[MAXNVAR] = {0.0};
+    unsigned long idxMax[MAXNVAR] = {0};
+    SU2_OMP_FOR_(schedule(static,omp_chunk_size) SU2_NOWAIT)
+    for (unsigned long p = 0; p < nPointDomain; ++p) {
+      const double* res = h_residual_out.data() + p * nVar;
+      for (unsigned short v = 0; v < nVar; ++v) {
+        ResidualReductions_PerThread(p, v, res[v], resRMS, resMax, idxMax);
+      }
+    }
+    END_SU2_OMP_FOR
+    ResidualReductions_FromAllThreads(geometry, config, resRMS, resMax, idxMax);
+
+    InitiateComms(geometry, config, MPI_QUANTITIES::SOLUTION);
+    CompleteComms(geometry, config, MPI_QUANTITIES::SOLUTION);
+
+    ComputeVerificationError(geometry, config);
+    AD::EndNoSharedReading();
+    return;
+  }
+#endif
 
   Explicit_Iteration<EULER_EXPLICIT>(geometry, solver_container, config, 0);
 }

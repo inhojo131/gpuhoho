@@ -119,9 +119,6 @@ protected:
   unsigned long BCThrust_Counter;
 
   vector<CFluidModel*> FluidModel;   /*!< \brief fluid model used in the solver. */
-#ifdef HAVE_CUDA
-  CEulerSolverGPUState* gpu_state_ = nullptr; /*!< \brief Placeholder GPU state (skeleton). */
-#endif
 
   /*--- Turbomachinery Solver Variables ---*/
 

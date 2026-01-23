@@ -1159,8 +1159,6 @@ void CConfig::SetConfig_Options() {
   addBoolOption("AXISYMMETRIC", Axisymmetric, false);
   /*\brief ENABLE_CUDA \n DESCRIPTION: GPU Acceleration \n DEFAULT: false \ingroup Config */
   addBoolOption("ENABLE_CUDA", Enable_Cuda, false);
-  /*\brief ENABLE_CUDA_VISCOUS_FLUX \n DESCRIPTION: GPU viscous flux path \n DEFAULT: false \ingroup Config */
-  addBoolOption("ENABLE_CUDA_VISCOUS_FLUX", Enable_Cuda_Viscous, false);
   /* DESCRIPTION: Add the gravity force */
   addBoolOption("GRAVITY_FORCE", GravityForce, false);
   /* DESCRIPTION: Add the Vorticity Confinement term*/

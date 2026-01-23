@@ -29,7 +29,6 @@
 #pragma once
 
 #include "../../../Common/include/geometry/CGeometry.hpp"
-#include "../../../Common/include/geometry/GeometryGPU.hpp"
 #include "../../../Common/include/parallelization/mpi_structure.hpp"
 #include "../integration/CIntegration.hpp"
 #include "../interfaces/CInterface.hpp"
@@ -78,7 +77,6 @@ class CDriver : public CDriverBase {
       interpolator_container; /*!< \brief Definition of the interpolation method between non-matching discretizations of
                                  the interface. */
   CInterface*** interface_container; /*!< \brief Definition of the interface of information and physics. */
-  GeometryGPU*** gpu_geometry_container; /*!< \brief Optional GPU geometry buffers per zone/instance. */
   bool dry_run;                      /*!< \brief Flag if SU2_CFD was started as dry-run via "SU2_CFD -d <config>.cfg" */
 
  public:
@@ -121,11 +119,6 @@ class CDriver : public CDriverBase {
    * \param[in] dummy - Definition of the dummy driver.
    */
   void InitializeGeometry(CConfig* config, CGeometry**& geometry, bool dummy);
-
-  /*!
-   * \brief Allocate/upload GPU geometry buffers (stub; no-op if GPU disabled).
-   */
-  void UploadGeometryToGPU(CGeometry** geometry, GeometryGPU*& gpu_geom) const;
 
   /*!
    * \brief Do the geometrical preprocessing for the DG FEM solver.

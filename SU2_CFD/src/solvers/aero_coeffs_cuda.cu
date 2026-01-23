@@ -4,98 +4,8 @@
 
 #include <cuda_runtime.h>
 #include <cmath>
-#include <vector>
-
-struct CEulerSolverGPUState;
-
-extern "C" __global__ void SetZeroKernel(double* CD, double* CL, double* CSF, double* CEff,
-                                          double* CFx, double* CFy, double* CFz,
-                                          double* CMx, double* CMy, double* CMz,
-                                          double* CoPx, double* CoPy, double* CoPz,
-                                          double* CT, double* CQ, double* CMerit,
-                                          int n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    CD[idx] = CL[idx] = CSF[idx] = CEff[idx] = 0.0;
-    CFx[idx] = CFy[idx] = CFz[idx] = CMx[idx] = 0.0;
-    CMy[idx] = CMz[idx] = CoPx[idx] = CoPy[idx] = 0.0;
-    CoPz[idx] = CT[idx] = CQ[idx] = CMerit[idx] = 0.0;
-  }
-}
-
-// Simple C-callable launcher. Caller owns device memory and stream.
-extern "C" void LaunchSetZeroKernel(double* CD, double* CL, double* CSF, double* CEff,
-                                    double* CFx, double* CFy, double* CFz,
-                                    double* CMx, double* CMy, double* CMz,
-                                    double* CoPx, double* CoPy, double* CoPz,
-                                    double* CT, double* CQ, double* CMerit,
-                                    int n, cudaStream_t stream) {
-  const int block = 256;
-  const int grid = (n + block - 1) / block;
-  SetZeroKernel<<<grid, block, 0, stream>>>(CD, CL, CSF, CEff, CFx, CFy, CFz,
-                                           CMx, CMy, CMz, CoPx, CoPy, CoPz,
-                                           CT, CQ, CMerit, n);
-}
-
-// Convenience helper: take host arrays, allocate temporary device buffers, zero them on GPU, copy back.
-extern "C" cudaError_t SetZeroHostArrays(double* CD, double* CL, double* CSF, double* CEff,
-                                         double* CFx, double* CFy, double* CFz,
-                                         double* CMx, double* CMy, double* CMz,
-                                         double* CoPx, double* CoPy, double* CoPz,
-                                         double* CT, double* CQ, double* CMerit,
-                                         int n, cudaStream_t stream) {
-  constexpr int kNumArrays = 16;
-  double* host[kNumArrays] = {CD, CL, CSF, CEff, CFx, CFy, CFz,
-                              CMx, CMy, CMz, CoPx, CoPy, CoPz,
-                              CT, CQ, CMerit};
-  double* device[kNumArrays] = {};
-  const size_t bytes = static_cast<size_t>(n) * sizeof(double);
-  cudaError_t err = cudaSuccess;
-
-  // Allocate and copy host -> device (if host pointer is provided)
-  for (int i = 0; i < kNumArrays && err == cudaSuccess; ++i) {
-    if (!host[i]) continue; // allow null to skip
-    err = cudaMalloc(reinterpret_cast<void**>(&device[i]), bytes);
-    if (err != cudaSuccess) break;
-    err = cudaMemcpyAsync(device[i], host[i], bytes, cudaMemcpyHostToDevice, stream);
-  }
-
-  // Launch kernel if allocation/copies succeeded
-  if (err == cudaSuccess) {
-    LaunchSetZeroKernel(device[0], device[1], device[2], device[3],
-                       device[4], device[5], device[6],
-                       device[7], device[8], device[9],
-                       device[10], device[11], device[12],
-                       device[13], device[14], device[15], n, stream);
-    err = cudaGetLastError();
-  }
-
-  // Copy results back to host (only if earlier steps succeeded)
-  for (int i = 0; i < kNumArrays && err == cudaSuccess; ++i) {
-    if (host[i] && device[i]) {
-      err = cudaMemcpyAsync(host[i], device[i], bytes, cudaMemcpyDeviceToHost, stream);
-    }
-  }
-
-  if (err == cudaSuccess) err = cudaStreamSynchronize(stream);
-
-  // Cleanup device buffers
-  for (int i = 0; i < kNumArrays; ++i) {
-    if (device[i]) cudaFree(device[i]);
-  }
-
-  return err;
-}
-
-/* Stub for future GPU residual assembly. Currently unimplemented and
- * returns cudaErrorNotSupported so the symbol is available at link time. */
-extern "C" cudaError_t ComputeResidualGPU(const void* /*geometry*/,
-                                          const void* /*solution*/,
-                                          const void* /*numerics*/,
-                                          cudaStream_t /*stream*/) {
-  return cudaErrorNotSupported;
-}
-
+#include "solvers/aero_coeffs_cuda.h"
+#if 0
 /* -------------------------------------------------------------------------
  * Minimal viscous-flux GPU scaffold.
  *
@@ -503,61 +413,799 @@ cleanup:
   return err;
 }
 
-/* GPU version of SumEdgeFluxes.
- * Inputs (all device pointers):
- *  - nodeEdgeOffsets: CSR offsets, size nPoint+1
- *  - nodeEdges      : edge indices, size nEdge
- *  - edgeNode0/1    : edge endpoints, size nEdge
- *  - edgeFluxes     : edge flux blocks, size nEdge * nVar
- * Output:
- *  - linSysRes      : residual blocks, size nPoint * nVar
- */
-__global__ void SumEdgeFluxesKernel(const unsigned long* nodeEdgeOffsets,
+#endif
+
+__device__ __forceinline__ void compute_flux_euler(const double* U, double gamma,
+                                                   double nx, double ny, double nz,
+                                                   unsigned short nDim, unsigned short nVar,
+                                                   double* F) {
+  const double rho = U[0];
+  const double inv_rho = 1.0 / rho;
+  const double u = U[1] * inv_rho;
+  const double v = U[2] * inv_rho;
+  const double w = (nDim == 3) ? U[3] * inv_rho : 0.0;
+  const double E = U[nVar - 1] * inv_rho;
+  const double kinetic = 0.5 * (u*u + v*v + w*w);
+  const double p = (gamma - 1.0) * rho * (E - kinetic);
+  const double vn = u * nx + v * ny + w * nz;
+
+  F[0] = rho * vn;
+  F[1] = rho * u * vn + p * nx;
+  F[2] = rho * v * vn + p * ny;
+  if (nDim == 3) {
+    F[3] = rho * w * vn + p * nz;
+  }
+  F[nVar - 1] = (rho * E + p) * vn;
+}
+
+__device__ __forceinline__ void build_tangent(const double nx, const double ny, const double nz,
+                                              double& t1x, double& t1y, double& t1z,
+                                              double& t2x, double& t2y, double& t2z) {
+  double ax = 0.0, ay = 0.0, az = 0.0;
+  if (fabs(nx) < 0.9) {
+    ax = 1.0;
+  } else {
+    ay = 1.0;
+  }
+  t1x = ny * az - nz * ay;
+  t1y = nz * ax - nx * az;
+  t1z = nx * ay - ny * ax;
+  const double norm = sqrt(t1x*t1x + t1y*t1y + t1z*t1z);
+  const double inv_norm = (norm > 0.0) ? 1.0 / norm : 0.0;
+  t1x *= inv_norm; t1y *= inv_norm; t1z *= inv_norm;
+
+  t2x = ny * t1z - nz * t1y;
+  t2y = nz * t1x - nx * t1z;
+  t2z = nx * t1y - ny * t1x;
+}
+
+__device__ __forceinline__ void compute_roe_flux(const double* UL, const double* UR,
+                                                 const double nx, const double ny, const double nz,
+                                                 unsigned short nDim, unsigned short nVar,
+                                                 double gamma, double* flux) {
+  double FL[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  double FR[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+
+  compute_flux_euler(UL, gamma, nx, ny, nz, nDim, nVar, FL);
+  compute_flux_euler(UR, gamma, nx, ny, nz, nDim, nVar, FR);
+
+  const double nmag = sqrt(nx*nx + ny*ny + nz*nz);
+  if (nmag <= 0.0) {
+    for (unsigned short v = 0; v < nVar; ++v) flux[v] = 0.0;
+    return;
+  }
+  const double inv_nmag = 1.0 / nmag;
+  const double nxh = nx * inv_nmag;
+  const double nyh = ny * inv_nmag;
+  const double nzh = nz * inv_nmag;
+
+  const double rhoL = UL[0];
+  const double rhoR = UR[0];
+  const double inv_rhoL = 1.0 / rhoL;
+  const double inv_rhoR = 1.0 / rhoR;
+  const double uL = UL[1] * inv_rhoL;
+  const double vL = UL[2] * inv_rhoL;
+  const double wL = (nDim == 3) ? UL[3] * inv_rhoL : 0.0;
+  const double uR = UR[1] * inv_rhoR;
+  const double vR = UR[2] * inv_rhoR;
+  const double wR = (nDim == 3) ? UR[3] * inv_rhoR : 0.0;
+  const double EL = UL[nVar - 1] * inv_rhoL;
+  const double ER = UR[nVar - 1] * inv_rhoR;
+  const double pL = (gamma - 1.0) * rhoL * (EL - 0.5 * (uL*uL + vL*vL + wL*wL));
+  const double pR = (gamma - 1.0) * rhoR * (ER - 0.5 * (uR*uR + vR*vR + wR*wR));
+  const double HL = (UL[nVar - 1] + pL) * inv_rhoL;
+  const double HR = (UR[nVar - 1] + pR) * inv_rhoR;
+
+  const double sqrt_rhoL = sqrt(rhoL);
+  const double sqrt_rhoR = sqrt(rhoR);
+  const double denom = sqrt_rhoL + sqrt_rhoR;
+  const double inv_denom = (denom > 0.0) ? 1.0 / denom : 0.0;
+
+  const double uBar = (sqrt_rhoL * uL + sqrt_rhoR * uR) * inv_denom;
+  const double vBar = (sqrt_rhoL * vL + sqrt_rhoR * vR) * inv_denom;
+  const double wBar = (sqrt_rhoL * wL + sqrt_rhoR * wR) * inv_denom;
+  const double HBar = (sqrt_rhoL * HL + sqrt_rhoR * HR) * inv_denom;
+  const double q2Bar = uBar*uBar + vBar*vBar + wBar*wBar;
+  double aBar2 = (gamma - 1.0) * (HBar - 0.5 * q2Bar);
+  if (aBar2 < 1e-14) aBar2 = 1e-14;
+  const double aBar = sqrt(aBar2);
+  const double rhoBar = sqrt_rhoL * sqrt_rhoR;
+  const double qBar = uBar * nxh + vBar * nyh + wBar * nzh;
+
+  const double drho = rhoR - rhoL;
+  const double du = uR - uL;
+  const double dv = vR - vL;
+  const double dw = wR - wL;
+  const double dqn = du * nxh + dv * nyh + dw * nzh;
+  const double dp = pR - pL;
+
+  double t1x = 0.0, t1y = 0.0, t1z = 0.0;
+  double t2x = 0.0, t2y = 0.0, t2z = 0.0;
+  if (nDim == 3) {
+    build_tangent(nxh, nyh, nzh, t1x, t1y, t1z, t2x, t2y, t2z);
+  } else {
+    t1x = -nyh; t1y = nxh; t1z = 0.0;
+  }
+
+  const double dUt1 = du * t1x + dv * t1y + dw * t1z;
+  const double dUt2 = du * t2x + dv * t2y + dw * t2z;
+  const double uBar_t1 = uBar * t1x + vBar * t1y + wBar * t1z;
+  const double uBar_t2 = uBar * t2x + vBar * t2y + wBar * t2z;
+
+  const double alpha1 = 0.5 * (dp - rhoBar * aBar * dqn) / aBar2;
+  const double alpha5 = 0.5 * (dp + rhoBar * aBar * dqn) / aBar2;
+  const double alpha2 = drho - dp / aBar2;
+  const double alpha3 = rhoBar * dUt1;
+  const double alpha4 = rhoBar * dUt2;
+
+  const double lam1 = fabs(qBar - aBar);
+  const double lam2 = fabs(qBar);
+  const double lam3 = lam2;
+  const double lam4 = lam2;
+  const double lam5 = fabs(qBar + aBar);
+
+  double D[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  D[0] += lam1 * alpha1;
+  D[1] += lam1 * alpha1 * (uBar - aBar * nxh);
+  D[2] += lam1 * alpha1 * (vBar - aBar * nyh);
+  D[3] += lam1 * alpha1 * (wBar - aBar * nzh);
+  D[4] += lam1 * alpha1 * (HBar - aBar * qBar);
+
+  D[0] += lam2 * alpha2;
+  D[1] += lam2 * alpha2 * uBar;
+  D[2] += lam2 * alpha2 * vBar;
+  D[3] += lam2 * alpha2 * wBar;
+  D[4] += lam2 * alpha2 * 0.5 * q2Bar;
+
+  D[1] += lam3 * alpha3 * t1x;
+  D[2] += lam3 * alpha3 * t1y;
+  D[3] += lam3 * alpha3 * t1z;
+  D[4] += lam3 * alpha3 * uBar_t1;
+
+  if (nDim == 3) {
+    D[1] += lam4 * alpha4 * t2x;
+    D[2] += lam4 * alpha4 * t2y;
+    D[3] += lam4 * alpha4 * t2z;
+    D[4] += lam4 * alpha4 * uBar_t2;
+  }
+
+  D[0] += lam5 * alpha5;
+  D[1] += lam5 * alpha5 * (uBar + aBar * nxh);
+  D[2] += lam5 * alpha5 * (vBar + aBar * nyh);
+  D[3] += lam5 * alpha5 * (wBar + aBar * nzh);
+  D[4] += lam5 * alpha5 * (HBar + aBar * qBar);
+
+  flux[0] = 0.5 * (FL[0] + FR[0]) - 0.5 * nmag * D[0];
+  flux[1] = 0.5 * (FL[1] + FR[1]) - 0.5 * nmag * D[1];
+  flux[2] = 0.5 * (FL[2] + FR[2]) - 0.5 * nmag * D[2];
+  flux[3] = 0.5 * (FL[3] + FR[3]) - 0.5 * nmag * D[3];
+  flux[nVar - 1] = 0.5 * (FL[nVar - 1] + FR[nVar - 1]) - 0.5 * nmag * D[4];
+}
+
+__device__ __forceinline__ void compute_viscous_flux(const double* UL, const double* UR,
+                                                     const double* gradU0, const double* gradU1,
+                                                     const double nx, const double ny, const double nz,
+                                                     double mu, unsigned short nDim,
+                                                     unsigned short nVar, double* flux) {
+  if (nDim != 3 || nVar != nDim + 2) {
+    for (unsigned short v = 0; v < nVar; ++v) flux[v] = 0.0;
+    return;
+  }
+
+  double grad[3][3];
+  for (unsigned short i = 0; i < 3; ++i) {
+    for (unsigned short j = 0; j < 3; ++j) {
+      grad[i][j] = 0.5 * (gradU0[i * 3 + j] + gradU1[i * 3 + j]);
+    }
+  }
+
+  const double divU = grad[0][0] + grad[1][1] + grad[2][2];
+  double tau[3][3];
+  const double two_thirds = 2.0 / 3.0;
+  for (unsigned short i = 0; i < 3; ++i) {
+    for (unsigned short j = 0; j < 3; ++j) {
+      tau[i][j] = mu * (grad[i][j] + grad[j][i]);
+    }
+    tau[i][i] -= two_thirds * mu * divU;
+  }
+
+  const double rhoL = UL[0];
+  const double rhoR = UR[0];
+  const double uL = UL[1] / rhoL;
+  const double vL = UL[2] / rhoL;
+  const double wL = UL[3] / rhoL;
+  const double uR = UR[1] / rhoR;
+  const double vR = UR[2] / rhoR;
+  const double wR = UR[3] / rhoR;
+  const double u = 0.5 * (uL + uR);
+  const double v = 0.5 * (vL + vR);
+  const double w = 0.5 * (wL + wR);
+
+  flux[0] = 0.0;
+  flux[1] = tau[0][0] * nx + tau[0][1] * ny + tau[0][2] * nz;
+  flux[2] = tau[1][0] * nx + tau[1][1] * ny + tau[1][2] * nz;
+  flux[3] = tau[2][0] * nx + tau[2][1] * ny + tau[2][2] * nz;
+  const double tau_u0 = tau[0][0] * u + tau[0][1] * v + tau[0][2] * w;
+  const double tau_u1 = tau[1][0] * u + tau[1][1] * v + tau[1][2] * w;
+  const double tau_u2 = tau[2][0] * u + tau[2][1] * v + tau[2][2] * w;
+  flux[nVar - 1] = tau_u0 * nx + tau_u1 * ny + tau_u2 * nz;
+}
+
+__global__ void RoeNSNodeUpdateKernel(const unsigned long* nodeEdgeOffsets,
+                                      const unsigned long* nodeEdges,
+                                      const unsigned long* edgeNode0,
+                                      const unsigned long* edgeNode1,
+                                      const double* edgeNormals,
+                                      const double* U,
+                                      const double* gradU,
+                                      const double* dt,
+                                      const double* volume,
+                                      const double* resExtra,
+                                      const double* resTrunc,
+                                      const unsigned long* bndOffsets,
+                                      const double* bndNormals,
+                                      const unsigned short* bndTypes,
+                                      const double* bndParams,
+                                      double mu,
+                                      double* Uout,
+                                      double* residualOut,
+                                      unsigned long nPointDomain,
+                                      unsigned long nPoint,
+                                      unsigned short nVar,
+                                      unsigned short nDim,
+                                      double gamma) {
+  const unsigned long iPoint = blockIdx.x * blockDim.x + threadIdx.x;
+  if (iPoint >= nPointDomain || iPoint >= nPoint) return;
+
+  double res[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+  for (auto idx = nodeEdgeOffsets[iPoint]; idx < nodeEdgeOffsets[iPoint + 1]; ++idx) {
+    const auto iEdge = nodeEdges[idx];
+    const unsigned long i0 = edgeNode0[iEdge];
+    const unsigned long i1 = edgeNode1[iEdge];
+    const double* UL = U + i0 * nVar;
+    const double* UR = U + i1 * nVar;
+    const double nx = edgeNormals[3 * iEdge + 0];
+    const double ny = edgeNormals[3 * iEdge + 1];
+    const double nz = edgeNormals[3 * iEdge + 2];
+
+    double flux_conv[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    double flux_visc[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    compute_roe_flux(UL, UR, nx, ny, nz, nDim, nVar, gamma, flux_conv);
+    compute_viscous_flux(UL, UR, gradU + i0 * 9, gradU + i1 * 9, nx, ny, nz, mu, nDim, nVar, flux_visc);
+
+    const bool first = (iPoint == i0);
+    const double sign = first ? 1.0 : -1.0;
+    for (unsigned short v = 0; v < nVar; ++v) {
+      res[v] += sign * (flux_conv[v] - flux_visc[v]);
+    }
+  }
+
+  if (bndOffsets && bndNormals && bndTypes && bndParams) {
+    const double* UL = U + iPoint * nVar;
+    const double rho_i = UL[0];
+    const double inv_rho_i = 1.0 / rho_i;
+    const double u_i = UL[1] * inv_rho_i;
+    const double v_i = UL[2] * inv_rho_i;
+    const double w_i = UL[3] * inv_rho_i;
+    const double E_i = UL[nVar - 1] * inv_rho_i;
+    const double p_i = (gamma - 1.0) * rho_i * (E_i - 0.5 * (u_i*u_i + v_i*v_i + w_i*w_i));
+
+    for (auto idx = bndOffsets[iPoint]; idx < bndOffsets[iPoint + 1]; ++idx) {
+      const double nx = bndNormals[3 * idx + 0];
+      const double ny = bndNormals[3 * idx + 1];
+      const double nz = bndNormals[3 * idx + 2];
+      const double nmag = sqrt(nx*nx + ny*ny + nz*nz);
+      if (nmag <= 0.0) continue;
+      const double inv_nmag = 1.0 / nmag;
+      const double nxh = nx * inv_nmag;
+      const double nyh = ny * inv_nmag;
+      const double nzh = nz * inv_nmag;
+
+      const unsigned short bc = bndTypes[idx];
+      const double* param = bndParams + idx * 5;
+      double rho_g = rho_i;
+      double u_g = u_i;
+      double v_g = v_i;
+      double w_g = w_i;
+      double p_g = p_i;
+
+      if (bc == static_cast<unsigned short>(GPUFlowBC::FARFIELD) ||
+          bc == static_cast<unsigned short>(GPUFlowBC::INLET)) {
+        rho_g = param[0];
+        u_g = param[1];
+        v_g = param[2];
+        w_g = param[3];
+        p_g = param[4];
+      } else if (bc == static_cast<unsigned short>(GPUFlowBC::OUTLET)) {
+        p_g = param[4];
+      } else if (bc == static_cast<unsigned short>(GPUFlowBC::SYMMETRY) ||
+                 bc == static_cast<unsigned short>(GPUFlowBC::EULER_WALL)) {
+        const double un = u_i * nxh + v_i * nyh + w_i * nzh;
+        u_g = u_i - 2.0 * un * nxh;
+        v_g = v_i - 2.0 * un * nyh;
+        w_g = w_i - 2.0 * un * nzh;
+      }
+
+      double UR[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+      const double vel2_g = u_g*u_g + v_g*v_g + w_g*w_g;
+      const double rhoE_g = p_g / (gamma - 1.0) + 0.5 * rho_g * vel2_g;
+      UR[0] = rho_g;
+      UR[1] = rho_g * u_g;
+      UR[2] = rho_g * v_g;
+      UR[3] = rho_g * w_g;
+      UR[nVar - 1] = rhoE_g;
+
+      double flux_conv[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+      compute_roe_flux(UL, UR, nx, ny, nz, nDim, nVar, gamma, flux_conv);
+      for (unsigned short v = 0; v < nVar; ++v) res[v] += flux_conv[v];
+    }
+  }
+
+  if (resExtra) {
+    const double* extra = resExtra + iPoint * nVar;
+    for (unsigned short v = 0; v < nVar; ++v) res[v] += extra[v];
+  }
+  if (resTrunc) {
+    const double* trunc = resTrunc + iPoint * nVar;
+    for (unsigned short v = 0; v < nVar; ++v) res[v] += trunc[v];
+  }
+
+  const double vol = volume ? volume[iPoint] : 0.0;
+  const double delta = (vol > 0.0 && dt) ? dt[iPoint] / vol : 0.0;
+  const double* Ui = U + iPoint * nVar;
+  double* Uo = Uout + iPoint * nVar;
+  for (unsigned short v = 0; v < nVar; ++v) {
+    Uo[v] = Ui[v] - res[v] * delta;
+  }
+
+  if (residualOut) {
+    double* out = residualOut + iPoint * nVar;
+    for (unsigned short v = 0; v < nVar; ++v) out[v] = res[v];
+  }
+}
+
+__global__ void RoeNodeUpdateKernel(const unsigned long* nodeEdgeOffsets,
                                     const unsigned long* nodeEdges,
                                     const unsigned long* edgeNode0,
                                     const unsigned long* edgeNode1,
-                                    const double* edgeFluxes,
-                                    double* linSysRes,
+                                    const double* edgeNormals,
+                                    const double* U,
+                                    const double* dt,
+                                    const double* volume,
+                                    const double* resExtra,
+                                    const double* resTrunc,
+                                    double* Uout,
+                                    double* residualOut,
+                                    unsigned long nPointDomain,
                                     unsigned long nPoint,
-                                    unsigned short nVar) {
+                                    unsigned short nVar,
+                                    unsigned short nDim,
+                                    double gamma) {
   const unsigned long iPoint = blockIdx.x * blockDim.x + threadIdx.x;
-  if (iPoint >= nPoint) return;
+  if (iPoint >= nPointDomain || iPoint >= nPoint) return;
 
-  double* res = linSysRes + iPoint * nVar;
-  for (unsigned short v = 0; v < nVar; ++v) res[v] = 0.0;
-
+  double res[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
   for (auto idx = nodeEdgeOffsets[iPoint]; idx < nodeEdgeOffsets[iPoint + 1]; ++idx) {
     const auto iEdge = nodeEdges[idx];
-    const double* flux = edgeFluxes + iEdge * nVar;
-    const bool first = (edgeNode0[iEdge] == iPoint);
-    for (unsigned short v = 0; v < nVar; ++v) {
-      res[v] += first ? flux[v] : -flux[v];
+    const unsigned long i0 = edgeNode0[iEdge];
+    const unsigned long i1 = edgeNode1[iEdge];
+    const double* UL = U + i0 * nVar;
+    const double* UR = U + i1 * nVar;
+    const double nx = edgeNormals[3 * iEdge + 0];
+    const double ny = edgeNormals[3 * iEdge + 1];
+    const double nz = edgeNormals[3 * iEdge + 2];
+
+    const double nmag = sqrt(nx*nx + ny*ny + nz*nz);
+    if (nmag <= 0.0) continue;
+    const double inv_nmag = 1.0 / nmag;
+    const double nxh = nx * inv_nmag;
+    const double nyh = ny * inv_nmag;
+    const double nzh = nz * inv_nmag;
+
+    double FL[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    double FR[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    compute_flux_euler(UL, gamma, nx, ny, nz, nDim, nVar, FL);
+    compute_flux_euler(UR, gamma, nx, ny, nz, nDim, nVar, FR);
+
+    const double rhoL = UL[0];
+    const double rhoR = UR[0];
+    const double inv_rhoL = 1.0 / rhoL;
+    const double inv_rhoR = 1.0 / rhoR;
+    const double uL = UL[1] * inv_rhoL;
+    const double vL = UL[2] * inv_rhoL;
+    const double wL = (nDim == 3) ? UL[3] * inv_rhoL : 0.0;
+    const double uR = UR[1] * inv_rhoR;
+    const double vR = UR[2] * inv_rhoR;
+    const double wR = (nDim == 3) ? UR[3] * inv_rhoR : 0.0;
+    const double EL = UL[nVar - 1] * inv_rhoL;
+    const double ER = UR[nVar - 1] * inv_rhoR;
+    const double pL = (gamma - 1.0) * rhoL * (EL - 0.5 * (uL*uL + vL*vL + wL*wL));
+    const double pR = (gamma - 1.0) * rhoR * (ER - 0.5 * (uR*uR + vR*vR + wR*wR));
+    const double HL = (UL[nVar - 1] + pL) * inv_rhoL;
+    const double HR = (UR[nVar - 1] + pR) * inv_rhoR;
+
+    const double sqrt_rhoL = sqrt(rhoL);
+    const double sqrt_rhoR = sqrt(rhoR);
+    const double denom = sqrt_rhoL + sqrt_rhoR;
+    const double inv_denom = (denom > 0.0) ? 1.0 / denom : 0.0;
+
+    const double uBar = (sqrt_rhoL * uL + sqrt_rhoR * uR) * inv_denom;
+    const double vBar = (sqrt_rhoL * vL + sqrt_rhoR * vR) * inv_denom;
+    const double wBar = (sqrt_rhoL * wL + sqrt_rhoR * wR) * inv_denom;
+    const double HBar = (sqrt_rhoL * HL + sqrt_rhoR * HR) * inv_denom;
+    const double q2Bar = uBar*uBar + vBar*vBar + wBar*wBar;
+    double aBar2 = (gamma - 1.0) * (HBar - 0.5 * q2Bar);
+    if (aBar2 < 1e-14) aBar2 = 1e-14;
+    const double aBar = sqrt(aBar2);
+    const double rhoBar = sqrt_rhoL * sqrt_rhoR;
+    const double qBar = uBar * nxh + vBar * nyh + wBar * nzh;
+
+    const double drho = rhoR - rhoL;
+    const double du = uR - uL;
+    const double dv = vR - vL;
+    const double dw = wR - wL;
+    const double dqn = du * nxh + dv * nyh + dw * nzh;
+    const double dp = pR - pL;
+
+    double t1x = 0.0, t1y = 0.0, t1z = 0.0;
+    double t2x = 0.0, t2y = 0.0, t2z = 0.0;
+    if (nDim == 3) {
+      build_tangent(nxh, nyh, nzh, t1x, t1y, t1z, t2x, t2y, t2z);
+    } else {
+      t1x = -nyh; t1y = nxh; t1z = 0.0;
     }
+
+    const double dUt1 = du * t1x + dv * t1y + dw * t1z;
+    const double dUt2 = du * t2x + dv * t2y + dw * t2z;
+    const double uBar_t1 = uBar * t1x + vBar * t1y + wBar * t1z;
+    const double uBar_t2 = uBar * t2x + vBar * t2y + wBar * t2z;
+
+    const double alpha1 = 0.5 * (dp - rhoBar * aBar * dqn) / aBar2;
+    const double alpha5 = 0.5 * (dp + rhoBar * aBar * dqn) / aBar2;
+    const double alpha2 = drho - dp / aBar2;
+    const double alpha3 = rhoBar * dUt1;
+    const double alpha4 = rhoBar * dUt2;
+
+    const double lam1 = fabs(qBar - aBar);
+    const double lam2 = fabs(qBar);
+    const double lam3 = lam2;
+    const double lam4 = lam2;
+    const double lam5 = fabs(qBar + aBar);
+
+    double D[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+    D[0] += lam1 * alpha1;
+    D[1] += lam1 * alpha1 * (uBar - aBar * nxh);
+    D[2] += lam1 * alpha1 * (vBar - aBar * nyh);
+    D[3] += lam1 * alpha1 * (wBar - aBar * nzh);
+    D[4] += lam1 * alpha1 * (HBar - aBar * qBar);
+
+    D[0] += lam2 * alpha2;
+    D[1] += lam2 * alpha2 * uBar;
+    D[2] += lam2 * alpha2 * vBar;
+    D[3] += lam2 * alpha2 * wBar;
+    D[4] += lam2 * alpha2 * 0.5 * q2Bar;
+
+    D[1] += lam3 * alpha3 * t1x;
+    D[2] += lam3 * alpha3 * t1y;
+    D[3] += lam3 * alpha3 * t1z;
+    D[4] += lam3 * alpha3 * uBar_t1;
+
+    if (nDim == 3) {
+      D[1] += lam4 * alpha4 * t2x;
+      D[2] += lam4 * alpha4 * t2y;
+      D[3] += lam4 * alpha4 * t2z;
+      D[4] += lam4 * alpha4 * uBar_t2;
+    }
+
+    D[0] += lam5 * alpha5;
+    D[1] += lam5 * alpha5 * (uBar + aBar * nxh);
+    D[2] += lam5 * alpha5 * (vBar + aBar * nyh);
+    D[3] += lam5 * alpha5 * (wBar + aBar * nzh);
+    D[4] += lam5 * alpha5 * (HBar + aBar * qBar);
+
+    const double flux0 = 0.5 * (FL[0] + FR[0]) - 0.5 * nmag * D[0];
+    const double flux1 = 0.5 * (FL[1] + FR[1]) - 0.5 * nmag * D[1];
+    const double flux2 = 0.5 * (FL[2] + FR[2]) - 0.5 * nmag * D[2];
+    const double fluxW = 0.5 * (FL[3] + FR[3]) - 0.5 * nmag * D[3];
+    const double fluxE = 0.5 * (FL[nVar - 1] + FR[nVar - 1]) - 0.5 * nmag * D[4];
+
+    const bool first = (iPoint == i0);
+    const double sign = first ? 1.0 : -1.0;
+    res[0] += sign * flux0;
+    res[1] += sign * flux1;
+    res[2] += sign * flux2;
+    if (nDim == 3) {
+      res[3] += sign * fluxW;
+    }
+    res[nVar - 1] += sign * fluxE;
+  }
+
+  if (resExtra) {
+    const double* extra = resExtra + iPoint * nVar;
+    for (unsigned short v = 0; v < nVar; ++v) res[v] += extra[v];
+  }
+  if (resTrunc) {
+    const double* trunc = resTrunc + iPoint * nVar;
+    for (unsigned short v = 0; v < nVar; ++v) res[v] += trunc[v];
+  }
+
+  const double vol = volume ? volume[iPoint] : 0.0;
+  const double delta = (vol > 0.0 && dt) ? dt[iPoint] / vol : 0.0;
+  const double* Ui = U + iPoint * nVar;
+  double* Uo = Uout + iPoint * nVar;
+  for (unsigned short v = 0; v < nVar; ++v) {
+    Uo[v] = Ui[v] - res[v] * delta;
+  }
+
+  if (residualOut) {
+    double* out = residualOut + iPoint * nVar;
+    for (unsigned short v = 0; v < nVar; ++v) out[v] = res[v];
   }
 }
 
-extern "C" cudaError_t SumEdgeFluxesGPU(const unsigned long* nodeEdgeOffsets,
-                                        const unsigned long* nodeEdges,
-                                        const unsigned long* edgeNode0,
-                                        const unsigned long* edgeNode1,
-                                        const double* edgeFluxes,
-                                        double* linSysRes,
-                                        unsigned long nPoint,
-                                        unsigned short nVar,
-                                        cudaStream_t stream) {
-  if (!nodeEdgeOffsets || !nodeEdges || !edgeNode0 || !edgeNode1 || !edgeFluxes || !linSysRes) {
+extern "C" cudaError_t ComputeEulerRoeUpdateHost(const unsigned long* h_nodeEdgeOffsets,
+                                                 const unsigned long* h_nodeEdges,
+                                                 const unsigned long* h_edgeNode0,
+                                                 const unsigned long* h_edgeNode1,
+                                                 const double* h_edgeNormals,
+                                                 const double* h_solution,
+                                                 const double* h_dt,
+                                                 const double* h_volume,
+                                                 const double* h_residual_extra,
+                                                 const double* h_residual_trunc,
+                                                 unsigned long nPointDomain,
+                                                 unsigned long nPoint,
+                                                 unsigned long nEdge,
+                                                 unsigned short nVar,
+                                                 unsigned short nDim,
+                                                 double gamma,
+                                                 double* h_solution_out,
+                                                 double* h_residual_out,
+                                                 cudaStream_t stream) {
+  if (!h_nodeEdgeOffsets || !h_nodeEdges || !h_edgeNode0 || !h_edgeNode1 ||
+      !h_edgeNormals || !h_solution || !h_dt || !h_volume || !h_solution_out) {
     return cudaErrorInvalidValue;
   }
-  const int block = 256;
-  const int grid = static_cast<int>((nPoint + block - 1) / block);
-  SumEdgeFluxesKernel<<<grid, block, 0, stream>>>(nodeEdgeOffsets, nodeEdges, edgeNode0, edgeNode1,
-                                                  edgeFluxes, linSysRes, nPoint, nVar);
-  return cudaGetLastError();
+  if (nDim < 2 || nDim > 3 || nVar != nDim + 2) {
+    return cudaErrorNotSupported;
+  }
+
+  unsigned long* d_nodeEdgeOffsets = nullptr;
+  unsigned long* d_nodeEdges = nullptr;
+  unsigned long* d_edgeNode0 = nullptr;
+  unsigned long* d_edgeNode1 = nullptr;
+  double* d_edgeNormals = nullptr;
+  double* d_solution = nullptr;
+  double* d_solution_out = nullptr;
+  double* d_dt = nullptr;
+  double* d_volume = nullptr;
+  double* d_res_extra = nullptr;
+  double* d_res_trunc = nullptr;
+  double* d_residual_out = nullptr;
+  cudaError_t err = cudaSuccess;
+
+  const size_t offsetsBytes = (nPoint + 1) * sizeof(unsigned long);
+  const unsigned long edgeListSize = h_nodeEdgeOffsets[nPoint];
+  const size_t nodeEdgesBytes = static_cast<size_t>(edgeListSize) * sizeof(unsigned long);
+  const size_t edgesBytes = nEdge * sizeof(unsigned long);
+  const size_t normalsBytes = nEdge * 3 * sizeof(double);
+  const size_t solBytes = static_cast<size_t>(nPoint) * nVar * sizeof(double);
+  const size_t dtBytes = static_cast<size_t>(nPoint) * sizeof(double);
+  const size_t volBytes = static_cast<size_t>(nPoint) * sizeof(double);
+  const size_t resBytes = static_cast<size_t>(nPoint) * nVar * sizeof(double);
+
+  err = cudaMalloc(&d_nodeEdgeOffsets, offsetsBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_nodeEdges, nodeEdgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNode0, edgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNode1, edgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNormals, normalsBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_solution, solBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_solution_out, solBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_dt, dtBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_volume, volBytes); if (err) goto cleanup;
+  if (h_residual_extra) { err = cudaMalloc(&d_res_extra, resBytes); if (err) goto cleanup; }
+  if (h_residual_trunc) { err = cudaMalloc(&d_res_trunc, resBytes); if (err) goto cleanup; }
+  if (h_residual_out) { err = cudaMalloc(&d_residual_out, resBytes); if (err) goto cleanup; }
+
+  err = cudaMemcpyAsync(d_nodeEdgeOffsets, h_nodeEdgeOffsets, offsetsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_nodeEdges, h_nodeEdges, nodeEdgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNode0, h_edgeNode0, edgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNode1, h_edgeNode1, edgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNormals, h_edgeNormals, normalsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_solution, h_solution, solBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_dt, h_dt, dtBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_volume, h_volume, volBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  if (h_residual_extra) {
+    err = cudaMemcpyAsync(d_res_extra, h_residual_extra, resBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+  if (h_residual_trunc) {
+    err = cudaMemcpyAsync(d_res_trunc, h_residual_trunc, resBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+
+  {
+    const int block = 256;
+    const int grid = static_cast<int>((nPointDomain + block - 1) / block);
+    RoeNodeUpdateKernel<<<grid, block, 0, stream>>>(d_nodeEdgeOffsets, d_nodeEdges,
+                                                    d_edgeNode0, d_edgeNode1, d_edgeNormals,
+                                                    d_solution, d_dt, d_volume,
+                                                    d_res_extra, d_res_trunc,
+                                                    d_solution_out, d_residual_out,
+                                                    nPointDomain, nPoint, nVar, nDim, gamma);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) goto cleanup;
+  }
+
+  err = cudaMemcpyAsync(h_solution_out, d_solution_out, solBytes, cudaMemcpyDeviceToHost, stream); if (err) goto cleanup;
+  if (h_residual_out) {
+    err = cudaMemcpyAsync(h_residual_out, d_residual_out, resBytes, cudaMemcpyDeviceToHost, stream); if (err) goto cleanup;
+  }
+  err = cudaStreamSynchronize(stream);
+
+cleanup:
+  if (d_nodeEdgeOffsets) cudaFree(d_nodeEdgeOffsets);
+  if (d_nodeEdges) cudaFree(d_nodeEdges);
+  if (d_edgeNode0) cudaFree(d_edgeNode0);
+  if (d_edgeNode1) cudaFree(d_edgeNode1);
+  if (d_edgeNormals) cudaFree(d_edgeNormals);
+  if (d_solution) cudaFree(d_solution);
+  if (d_solution_out) cudaFree(d_solution_out);
+  if (d_dt) cudaFree(d_dt);
+  if (d_volume) cudaFree(d_volume);
+  if (d_res_extra) cudaFree(d_res_extra);
+  if (d_res_trunc) cudaFree(d_res_trunc);
+  if (d_residual_out) cudaFree(d_residual_out);
+  return err;
 }
 
-/* Stub GPU state management for CEulerSolver (no-op until full GPU path exists). */
-extern "C" CEulerSolverGPUState* CreateEulerSolverGPU(int /*nZone*/) {
-  return nullptr;
-}
+extern "C" cudaError_t ComputeNSRoeUpdateHost(const unsigned long* h_nodeEdgeOffsets,
+                                              const unsigned long* h_nodeEdges,
+                                              const unsigned long* h_edgeNode0,
+                                              const unsigned long* h_edgeNode1,
+                                              const double* h_edgeNormals,
+                                              const double* h_solution,
+                                              const double* h_gradU,
+                                              const double* h_dt,
+                                              const double* h_volume,
+                                              const double* h_residual_extra,
+                                              const double* h_residual_trunc,
+                                              const unsigned long* h_bndOffsets,
+                                              const double* h_bndNormals,
+                                              const unsigned short* h_bndTypes,
+                                              const double* h_bndParams,
+                                              unsigned long nPointDomain,
+                                              unsigned long nPoint,
+                                              unsigned long nEdge,
+                                              unsigned long nBnd,
+                                              unsigned short nVar,
+                                              unsigned short nDim,
+                                              double gamma,
+                                              double mu,
+                                              double* h_solution_out,
+                                              double* h_residual_out,
+                                              cudaStream_t stream) {
+  if (!h_nodeEdgeOffsets || !h_nodeEdges || !h_edgeNode0 || !h_edgeNode1 ||
+      !h_edgeNormals || !h_solution || !h_gradU || !h_dt || !h_volume || !h_solution_out) {
+    return cudaErrorInvalidValue;
+  }
+  if (nDim != 3 || nVar != nDim + 2) {
+    return cudaErrorNotSupported;
+  }
 
-extern "C" void DestroyEulerSolverGPU(CEulerSolverGPUState* /*state*/) {}
+  unsigned long* d_nodeEdgeOffsets = nullptr;
+  unsigned long* d_nodeEdges = nullptr;
+  unsigned long* d_edgeNode0 = nullptr;
+  unsigned long* d_edgeNode1 = nullptr;
+  unsigned long* d_bndOffsets = nullptr;
+  double* d_edgeNormals = nullptr;
+  double* d_solution = nullptr;
+  double* d_solution_out = nullptr;
+  double* d_gradU = nullptr;
+  double* d_dt = nullptr;
+  double* d_volume = nullptr;
+  double* d_res_extra = nullptr;
+  double* d_res_trunc = nullptr;
+  double* d_residual_out = nullptr;
+  double* d_bndNormals = nullptr;
+  unsigned short* d_bndTypes = nullptr;
+  double* d_bndParams = nullptr;
+  cudaError_t err = cudaSuccess;
+
+  const size_t offsetsBytes = (nPoint + 1) * sizeof(unsigned long);
+  const unsigned long edgeListSize = h_nodeEdgeOffsets[nPoint];
+  const size_t nodeEdgesBytes = static_cast<size_t>(edgeListSize) * sizeof(unsigned long);
+  const size_t edgesBytes = nEdge * sizeof(unsigned long);
+  const size_t normalsBytes = nEdge * 3 * sizeof(double);
+  const size_t solBytes = static_cast<size_t>(nPoint) * nVar * sizeof(double);
+  const size_t gradBytes = static_cast<size_t>(nPoint) * 9 * sizeof(double);
+  const size_t dtBytes = static_cast<size_t>(nPoint) * sizeof(double);
+  const size_t volBytes = static_cast<size_t>(nPoint) * sizeof(double);
+  const size_t resBytes = static_cast<size_t>(nPoint) * nVar * sizeof(double);
+  const size_t bndOffsetsBytes = (nPoint + 1) * sizeof(unsigned long);
+  const size_t bndNormalsBytes = static_cast<size_t>(nBnd) * 3 * sizeof(double);
+  const size_t bndTypesBytes = static_cast<size_t>(nBnd) * sizeof(unsigned short);
+  const size_t bndParamsBytes = static_cast<size_t>(nBnd) * 5 * sizeof(double);
+
+  err = cudaMalloc(&d_nodeEdgeOffsets, offsetsBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_nodeEdges, nodeEdgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNode0, edgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNode1, edgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNormals, normalsBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_solution, solBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_solution_out, solBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_gradU, gradBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_dt, dtBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_volume, volBytes); if (err) goto cleanup;
+  if (h_residual_extra) { err = cudaMalloc(&d_res_extra, resBytes); if (err) goto cleanup; }
+  if (h_residual_trunc) { err = cudaMalloc(&d_res_trunc, resBytes); if (err) goto cleanup; }
+  if (h_residual_out) { err = cudaMalloc(&d_residual_out, resBytes); if (err) goto cleanup; }
+  if (h_bndOffsets) { err = cudaMalloc(&d_bndOffsets, bndOffsetsBytes); if (err) goto cleanup; }
+  if (nBnd > 0) {
+    if (h_bndNormals) { err = cudaMalloc(&d_bndNormals, bndNormalsBytes); if (err) goto cleanup; }
+    if (h_bndTypes) { err = cudaMalloc(&d_bndTypes, bndTypesBytes); if (err) goto cleanup; }
+    if (h_bndParams) { err = cudaMalloc(&d_bndParams, bndParamsBytes); if (err) goto cleanup; }
+  }
+
+  err = cudaMemcpyAsync(d_nodeEdgeOffsets, h_nodeEdgeOffsets, offsetsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_nodeEdges, h_nodeEdges, nodeEdgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNode0, h_edgeNode0, edgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNode1, h_edgeNode1, edgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNormals, h_edgeNormals, normalsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_solution, h_solution, solBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_gradU, h_gradU, gradBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_dt, h_dt, dtBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_volume, h_volume, volBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  if (h_residual_extra) {
+    err = cudaMemcpyAsync(d_res_extra, h_residual_extra, resBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+  if (h_residual_trunc) {
+    err = cudaMemcpyAsync(d_res_trunc, h_residual_trunc, resBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+  if (h_bndOffsets) {
+    err = cudaMemcpyAsync(d_bndOffsets, h_bndOffsets, bndOffsetsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+  if (nBnd > 0) {
+    if (h_bndNormals) { err = cudaMemcpyAsync(d_bndNormals, h_bndNormals, bndNormalsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup; }
+    if (h_bndTypes) { err = cudaMemcpyAsync(d_bndTypes, h_bndTypes, bndTypesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup; }
+    if (h_bndParams) { err = cudaMemcpyAsync(d_bndParams, h_bndParams, bndParamsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup; }
+  }
+
+  {
+    const int block = 256;
+    const int grid = static_cast<int>((nPointDomain + block - 1) / block);
+    RoeNSNodeUpdateKernel<<<grid, block, 0, stream>>>(d_nodeEdgeOffsets, d_nodeEdges,
+                                                      d_edgeNode0, d_edgeNode1, d_edgeNormals,
+                                                      d_solution, d_gradU, d_dt, d_volume,
+                                                      d_res_extra, d_res_trunc,
+                                                      d_bndOffsets, d_bndNormals, d_bndTypes, d_bndParams,
+                                                      mu, d_solution_out, d_residual_out,
+                                                      nPointDomain, nPoint, nVar, nDim, gamma);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) goto cleanup;
+  }
+
+  err = cudaMemcpyAsync(h_solution_out, d_solution_out, solBytes, cudaMemcpyDeviceToHost, stream); if (err) goto cleanup;
+  if (h_residual_out) {
+    err = cudaMemcpyAsync(h_residual_out, d_residual_out, resBytes, cudaMemcpyDeviceToHost, stream); if (err) goto cleanup;
+  }
+  err = cudaStreamSynchronize(stream);
+
+cleanup:
+  if (d_nodeEdgeOffsets) cudaFree(d_nodeEdgeOffsets);
+  if (d_nodeEdges) cudaFree(d_nodeEdges);
+  if (d_edgeNode0) cudaFree(d_edgeNode0);
+  if (d_edgeNode1) cudaFree(d_edgeNode1);
+  if (d_bndOffsets) cudaFree(d_bndOffsets);
+  if (d_edgeNormals) cudaFree(d_edgeNormals);
+  if (d_solution) cudaFree(d_solution);
+  if (d_solution_out) cudaFree(d_solution_out);
+  if (d_gradU) cudaFree(d_gradU);
+  if (d_dt) cudaFree(d_dt);
+  if (d_volume) cudaFree(d_volume);
+  if (d_res_extra) cudaFree(d_res_extra);
+  if (d_res_trunc) cudaFree(d_res_trunc);
+  if (d_residual_out) cudaFree(d_residual_out);
+  if (d_bndNormals) cudaFree(d_bndNormals);
+  if (d_bndTypes) cudaFree(d_bndTypes);
+  if (d_bndParams) cudaFree(d_bndParams);
+  return err;
+}

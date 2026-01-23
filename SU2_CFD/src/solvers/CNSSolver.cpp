@@ -31,6 +31,44 @@
 #include "../../../Common/include/toolboxes/geometry_toolbox.hpp"
 #include "../../include/solvers/CFVMFlowSolverBase.inl"
 
+namespace {
+bool HasMarkerKind(const CConfig* config, unsigned short kind) {
+  for (unsigned short iMarker = 0; iMarker < config->GetnMarker_All(); ++iMarker) {
+    if (config->GetMarker_All_KindBC(iMarker) == kind) return true;
+  }
+  return false;
+}
+
+bool UseGPUNodeUpdateNS(const CNSSolver* solver, const CConfig* config) {
+  const bool ideal_gas = (config->GetKind_FluidModel() == STANDARD_AIR) ||
+                         (config->GetKind_FluidModel() == IDEAL_GAS);
+  const bool low_mach_corr = config->Low_Mach_Correction();
+  const bool muscl = config->GetMUSCL_Flow();
+  const bool limiter = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
+  const bool has_inlet = HasMarkerKind(config, INLET_FLOW);
+  const bool inlet_ok = !has_inlet || (config->GetKind_Inlet() == INLET_TYPE::VELOCITY_INLET);
+
+  return config->GetCUDA() &&
+         config->GetViscous() &&
+         (config->GetKind_ConvNumScheme() == SPACE_UPWIND) &&
+         (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
+         ideal_gas && !low_mach_corr &&
+         !solver->dynamic_grid &&
+         !solver->ReducerStrategy &&
+         !muscl && !limiter &&
+         inlet_ok &&
+         (config->GetKind_Turb_Model() == TURB_MODEL::NONE) &&
+         (config->GetKind_ViscosityModel() == VISCOSITYMODEL::CONSTANT) &&
+         !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint() &&
+         !config->GetRotating_Frame() &&
+         !config->GetAxisymmetric() &&
+         (config->GetGravityForce() == NO) &&
+         !config->GetBody_Force() &&
+         config->GetEnergy_Equation() &&
+         (solver->nDim == 3);
+}
+} // namespace
+
 /*--- Explicit instantiation of the parent class of CEulerSolver,
  *    to spread the compilation over two cpp files. ---*/
 template class CFVMFlowSolverBase<CEulerVariable, ENUM_REGIME::COMPRESSIBLE>;
@@ -124,6 +162,242 @@ void CNSSolver::Preprocessing(CGeometry *geometry, CSolver **solver_container, C
     SetTau_Wall_WF(geometry, solver_container, config);
   }
 
+}
+
+void CNSSolver::ExplicitEuler_Iteration(CGeometry *geometry, CSolver **solver_container, CConfig *config) {
+
+  const bool use_gpu_update = UseGPUNodeUpdateNS(this, config);
+
+#ifdef HAVE_CUDA
+  if (use_gpu_update) {
+    const unsigned long nPoint = geometry->GetnPoint();
+    const unsigned long nEdge = geometry->GetnEdge();
+    const unsigned long nPointDomain = this->nPointDomain;
+    const unsigned short nDim = geometry->GetnDim();
+    const unsigned short nVar = this->nVar;
+
+    std::vector<unsigned long> h_off(nPoint + 1, 0), h_edges;
+    h_edges.reserve(nEdge);
+    for (unsigned long p = 0; p < nPoint; ++p) {
+      for (auto e : geometry->nodes->GetEdges(p)) h_edges.push_back(e);
+      h_off[p + 1] = h_edges.size();
+    }
+    std::vector<unsigned long> h_e0(nEdge), h_e1(nEdge);
+    for (unsigned long e = 0; e < nEdge; ++e) {
+      h_e0[e] = geometry->edges->GetNode(e, 0);
+      h_e1[e] = geometry->edges->GetNode(e, 1);
+    }
+    std::vector<double> h_normal(static_cast<size_t>(nEdge) * 3, 0.0);
+    for (unsigned long e = 0; e < nEdge; ++e) {
+      const su2double* normal = geometry->edges->GetNormal(e);
+      h_normal[3 * e + 0] = normal[0];
+      h_normal[3 * e + 1] = normal[1];
+      h_normal[3 * e + 2] = normal[2];
+    }
+
+    std::vector<double> h_solution(static_cast<size_t>(nPoint) * nVar, 0.0);
+    std::vector<double> h_dt(nPoint, 0.0);
+    std::vector<double> h_volume(nPoint, 0.0);
+    std::vector<double> h_residual_extra(static_cast<size_t>(nPoint) * nVar, 0.0);
+    std::vector<double> h_residual_trunc(static_cast<size_t>(nPoint) * nVar, 0.0);
+    std::vector<double> h_grad_u(static_cast<size_t>(nPoint) * 9, 0.0);
+
+    const unsigned short vel_idx = prim_idx.Velocity();
+    for (unsigned long p = 0; p < nPoint; ++p) {
+      const su2double* sol = nodes->GetSolution(p);
+      for (unsigned short v = 0; v < nVar; ++v) {
+        h_solution[static_cast<size_t>(p) * nVar + v] = sol[v];
+      }
+      h_dt[p] = nodes->GetDelta_Time(p);
+      h_volume[p] = geometry->nodes->GetVolume(p) + geometry->nodes->GetPeriodicVolume(p);
+      const su2double* res_extra = LinSysRes.GetBlock(p);
+      const su2double* res_trunc = nodes->GetResTruncError(p);
+      for (unsigned short v = 0; v < nVar; ++v) {
+        h_residual_extra[static_cast<size_t>(p) * nVar + v] = res_extra[v];
+        h_residual_trunc[static_cast<size_t>(p) * nVar + v] = res_trunc[v];
+      }
+      for (unsigned short i = 0; i < 3; ++i) {
+        for (unsigned short j = 0; j < 3; ++j) {
+          h_grad_u[static_cast<size_t>(p) * 9 + i * 3 + j] =
+              nodes->GetGradient_Primitive(p, vel_idx + i, j);
+        }
+      }
+    }
+
+    std::vector<unsigned long> bnd_counts(nPoint, 0);
+    for (unsigned short iMarker = 0; iMarker < config->GetnMarker_All(); ++iMarker) {
+      const auto kind = config->GetMarker_All_KindBC(iMarker);
+      if (kind != FAR_FIELD && kind != INLET_FLOW && kind != OUTLET_FLOW &&
+          kind != SYMMETRY_PLANE && kind != EULER_WALL) {
+        continue;
+      }
+      if (kind == INLET_FLOW && config->GetKind_Inlet() != INLET_TYPE::VELOCITY_INLET) {
+        continue;
+      }
+      for (auto iVertex = 0ul; iVertex < geometry->nVertex[iMarker]; ++iVertex) {
+        const auto iPoint = geometry->vertex[iMarker][iVertex]->GetNode();
+        if (!geometry->nodes->GetDomain(iPoint)) continue;
+        ++bnd_counts[iPoint];
+      }
+    }
+
+    std::vector<unsigned long> h_bnd_offsets(nPoint + 1, 0);
+    for (unsigned long p = 0; p < nPoint; ++p) {
+      h_bnd_offsets[p + 1] = h_bnd_offsets[p] + bnd_counts[p];
+    }
+    const unsigned long nBnd = h_bnd_offsets[nPoint];
+    std::vector<unsigned long> bnd_cursor = h_bnd_offsets;
+    std::vector<double> h_bnd_normals(static_cast<size_t>(nBnd) * 3, 0.0);
+    std::vector<unsigned short> h_bnd_types(nBnd, 0);
+    std::vector<double> h_bnd_params(static_cast<size_t>(nBnd) * 5, 0.0);
+
+    const su2double rho_inf = config->GetDensity_FreeStreamND();
+    const su2double* vel_inf = config->GetVelocity_FreeStreamND();
+    const su2double p_inf = config->GetPressure_FreeStreamND();
+    const su2double gas_constant = config->GetGas_ConstantND();
+
+    for (unsigned short iMarker = 0; iMarker < config->GetnMarker_All(); ++iMarker) {
+      const auto kind = config->GetMarker_All_KindBC(iMarker);
+      if (kind != FAR_FIELD && kind != INLET_FLOW && kind != OUTLET_FLOW &&
+          kind != SYMMETRY_PLANE && kind != EULER_WALL) {
+        continue;
+      }
+      if (kind == INLET_FLOW && config->GetKind_Inlet() != INLET_TYPE::VELOCITY_INLET) {
+        continue;
+      }
+
+      const string marker_tag = config->GetMarker_All_TagBound(iMarker);
+      for (auto iVertex = 0ul; iVertex < geometry->nVertex[iMarker]; ++iVertex) {
+        const auto iPoint = geometry->vertex[iMarker][iVertex]->GetNode();
+        if (!geometry->nodes->GetDomain(iPoint)) continue;
+
+        const unsigned long idx = bnd_cursor[iPoint]++;
+        su2double normal[MAXNDIM] = {0.0, 0.0, 0.0};
+        geometry->vertex[iMarker][iVertex]->GetNormal(normal);
+        for (unsigned short iDim = 0; iDim < nDim; ++iDim) normal[iDim] = -normal[iDim];
+        h_bnd_normals[3 * idx + 0] = normal[0];
+        h_bnd_normals[3 * idx + 1] = normal[1];
+        h_bnd_normals[3 * idx + 2] = normal[2];
+
+        if (kind == FAR_FIELD) {
+          h_bnd_types[idx] = static_cast<unsigned short>(GPUFlowBC::FARFIELD);
+          h_bnd_params[idx * 5 + 0] = rho_inf;
+          h_bnd_params[idx * 5 + 1] = vel_inf[0];
+          h_bnd_params[idx * 5 + 2] = vel_inf[1];
+          h_bnd_params[idx * 5 + 3] = vel_inf[2];
+          h_bnd_params[idx * 5 + 4] = p_inf;
+        } else if (kind == INLET_FLOW) {
+          const su2double T_in = Inlet_Ttotal[iMarker][iVertex] / config->GetTemperature_Ref();
+          const su2double P_in = Inlet_Ptotal[iMarker][iVertex] / config->GetPressure_Ref();
+          const su2double u_in = Inlet_FlowDir[iMarker][iVertex][0] / config->GetVelocity_Ref();
+          const su2double v_in = Inlet_FlowDir[iMarker][iVertex][1] / config->GetVelocity_Ref();
+          const su2double w_in = Inlet_FlowDir[iMarker][iVertex][2] / config->GetVelocity_Ref();
+          const su2double rho_in = P_in / (gas_constant * T_in);
+          h_bnd_types[idx] = static_cast<unsigned short>(GPUFlowBC::INLET);
+          h_bnd_params[idx * 5 + 0] = rho_in;
+          h_bnd_params[idx * 5 + 1] = u_in;
+          h_bnd_params[idx * 5 + 2] = v_in;
+          h_bnd_params[idx * 5 + 3] = w_in;
+          h_bnd_params[idx * 5 + 4] = P_in;
+        } else if (kind == OUTLET_FLOW) {
+          const su2double P_out = config->GetOutlet_Pressure(marker_tag) / config->GetPressure_Ref();
+          h_bnd_types[idx] = static_cast<unsigned short>(GPUFlowBC::OUTLET);
+          h_bnd_params[idx * 5 + 4] = P_out;
+        } else if (kind == SYMMETRY_PLANE) {
+          h_bnd_types[idx] = static_cast<unsigned short>(GPUFlowBC::SYMMETRY);
+        } else if (kind == EULER_WALL) {
+          h_bnd_types[idx] = static_cast<unsigned short>(GPUFlowBC::EULER_WALL);
+        }
+      }
+    }
+
+    std::vector<double> h_solution_out(static_cast<size_t>(nPoint) * nVar, 0.0);
+    std::vector<double> h_residual_out(static_cast<size_t>(nPoint) * nVar, 0.0);
+    const su2double mu = config->GetViscosity_FreeStreamND();
+
+    AD::StartNoSharedReading();
+    cudaError_t err = ComputeNSRoeUpdateHost(h_off.data(), h_edges.data(),
+                                             h_e0.data(), h_e1.data(),
+                                             h_normal.data(), h_solution.data(),
+                                             h_grad_u.data(), h_dt.data(), h_volume.data(),
+                                             h_residual_extra.data(), h_residual_trunc.data(),
+                                             h_bnd_offsets.data(), h_bnd_normals.data(),
+                                             h_bnd_types.data(), h_bnd_params.data(),
+                                             nPointDomain, nPoint, nEdge, nBnd, nVar, nDim,
+                                             Gamma, mu, h_solution_out.data(),
+                                             h_residual_out.data(), 0);
+    if (err != cudaSuccess) {
+      AD::EndNoSharedReading();
+      SU2_MPI::Error("GPU NS Roe update computation failed.", CURRENT_FUNCTION);
+    }
+
+    SU2_OMP_FOR_STAT(omp_chunk_size)
+    for (unsigned long p = 0; p < nPointDomain; ++p) {
+      for (unsigned short v = 0; v < nVar; ++v) {
+        nodes->SetSolution(p, v, h_solution_out[static_cast<size_t>(p) * nVar + v]);
+      }
+      LinSysRes.SetBlock(p, h_residual_out.data() + p * nVar);
+    }
+    END_SU2_OMP_FOR
+
+    su2double resMax[MAXNVAR] = {0.0}, resRMS[MAXNVAR] = {0.0};
+    unsigned long idxMax[MAXNVAR] = {0};
+    SU2_OMP_FOR_(schedule(static,omp_chunk_size) SU2_NOWAIT)
+    for (unsigned long p = 0; p < nPointDomain; ++p) {
+      const double* res = h_residual_out.data() + p * nVar;
+      for (unsigned short v = 0; v < nVar; ++v) {
+        ResidualReductions_PerThread(p, v, res[v], resRMS, resMax, idxMax);
+      }
+    }
+    END_SU2_OMP_FOR
+    ResidualReductions_FromAllThreads(geometry, config, resRMS, resMax, idxMax);
+
+    InitiateComms(geometry, config, MPI_QUANTITIES::SOLUTION);
+    CompleteComms(geometry, config, MPI_QUANTITIES::SOLUTION);
+
+    ComputeVerificationError(geometry, config);
+    AD::EndNoSharedReading();
+    return;
+  }
+#endif
+
+  CEulerSolver::ExplicitEuler_Iteration(geometry, solver_container, config);
+}
+
+void CNSSolver::Upwind_Residual(CGeometry *geometry, CSolver **solver_container, CNumerics **numerics_container,
+                                CConfig *config, unsigned short iMesh) {
+  if (UseGPUNodeUpdateNS(this, config)) return;
+  CEulerSolver::Upwind_Residual(geometry, solver_container, numerics_container, config, iMesh);
+}
+
+void CNSSolver::BC_Far_Field(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                             CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
+  if (UseGPUNodeUpdateNS(this, config)) return;
+  CEulerSolver::BC_Far_Field(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
+}
+
+void CNSSolver::BC_Inlet(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                         CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
+  if (UseGPUNodeUpdateNS(this, config)) return;
+  CEulerSolver::BC_Inlet(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
+}
+
+void CNSSolver::BC_Outlet(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                          CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
+  if (UseGPUNodeUpdateNS(this, config)) return;
+  CEulerSolver::BC_Outlet(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
+}
+
+void CNSSolver::BC_Sym_Plane(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                             CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
+  if (UseGPUNodeUpdateNS(this, config)) return;
+  CEulerSolver::BC_Sym_Plane(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
+}
+
+void CNSSolver::BC_Euler_Wall(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
+                              CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
+  if (UseGPUNodeUpdateNS(this, config)) return;
+  CEulerSolver::BC_Euler_Wall(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
 }
 
 unsigned long CNSSolver::SetPrimitive_Variables(CSolver **solver_container, const CConfig *config) {
