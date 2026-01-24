@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <cmath>
-#include "solvers/aero_coeffs_cuda.h"
+#include "../../include/solvers/aero_coeffs_cuda.h"
 #if 0
 /* -------------------------------------------------------------------------
  * Minimal viscous-flux GPU scaffold.
@@ -1181,6 +1181,171 @@ extern "C" cudaError_t ComputeNSRoeUpdateHost(const unsigned long* h_nodeEdgeOff
                                                       nPointDomain, nPoint, nVar, nDim, gamma);
     err = cudaGetLastError();
     if (err != cudaSuccess) goto cleanup;
+  }
+
+  err = cudaMemcpyAsync(h_solution_out, d_solution_out, solBytes, cudaMemcpyDeviceToHost, stream); if (err) goto cleanup;
+  if (h_residual_out) {
+    err = cudaMemcpyAsync(h_residual_out, d_residual_out, resBytes, cudaMemcpyDeviceToHost, stream); if (err) goto cleanup;
+  }
+  err = cudaStreamSynchronize(stream);
+
+cleanup:
+  if (d_nodeEdgeOffsets) cudaFree(d_nodeEdgeOffsets);
+  if (d_nodeEdges) cudaFree(d_nodeEdges);
+  if (d_edgeNode0) cudaFree(d_edgeNode0);
+  if (d_edgeNode1) cudaFree(d_edgeNode1);
+  if (d_bndOffsets) cudaFree(d_bndOffsets);
+  if (d_edgeNormals) cudaFree(d_edgeNormals);
+  if (d_solution) cudaFree(d_solution);
+  if (d_solution_out) cudaFree(d_solution_out);
+  if (d_gradU) cudaFree(d_gradU);
+  if (d_dt) cudaFree(d_dt);
+  if (d_volume) cudaFree(d_volume);
+  if (d_res_extra) cudaFree(d_res_extra);
+  if (d_res_trunc) cudaFree(d_res_trunc);
+  if (d_residual_out) cudaFree(d_residual_out);
+  if (d_bndNormals) cudaFree(d_bndNormals);
+  if (d_bndTypes) cudaFree(d_bndTypes);
+  if (d_bndParams) cudaFree(d_bndParams);
+  return err;
+}
+
+extern "C" cudaError_t ComputeNSRoeUpdateLoopHost(const unsigned long* h_nodeEdgeOffsets,
+                                                  const unsigned long* h_nodeEdges,
+                                                  const unsigned long* h_edgeNode0,
+                                                  const unsigned long* h_edgeNode1,
+                                                  const double* h_edgeNormals,
+                                                  const double* h_solution,
+                                                  const double* h_gradU,
+                                                  const double* h_dt,
+                                                  const double* h_volume,
+                                                  const double* h_residual_extra,
+                                                  const double* h_residual_trunc,
+                                                  const unsigned long* h_bndOffsets,
+                                                  const double* h_bndNormals,
+                                                  const unsigned short* h_bndTypes,
+                                                  const double* h_bndParams,
+                                                  unsigned long nPointDomain,
+                                                  unsigned long nPoint,
+                                                  unsigned long nEdge,
+                                                  unsigned long nBnd,
+                                                  unsigned short nVar,
+                                                  unsigned short nDim,
+                                                  double gamma,
+                                                  double mu,
+                                                  unsigned long nIter,
+                                                  double* h_solution_out,
+                                                  double* h_residual_out,
+                                                  cudaStream_t stream) {
+  if (!h_nodeEdgeOffsets || !h_nodeEdges || !h_edgeNode0 || !h_edgeNode1 ||
+      !h_edgeNormals || !h_solution || !h_gradU || !h_dt || !h_volume || !h_solution_out) {
+    return cudaErrorInvalidValue;
+  }
+  if (nDim != 3 || nVar != nDim + 2 || nIter == 0) {
+    return cudaErrorNotSupported;
+  }
+
+  unsigned long* d_nodeEdgeOffsets = nullptr;
+  unsigned long* d_nodeEdges = nullptr;
+  unsigned long* d_edgeNode0 = nullptr;
+  unsigned long* d_edgeNode1 = nullptr;
+  unsigned long* d_bndOffsets = nullptr;
+  double* d_edgeNormals = nullptr;
+  double* d_solution = nullptr;
+  double* d_solution_out = nullptr;
+  double* d_gradU = nullptr;
+  double* d_dt = nullptr;
+  double* d_volume = nullptr;
+  double* d_res_extra = nullptr;
+  double* d_res_trunc = nullptr;
+  double* d_residual_out = nullptr;
+  double* d_bndNormals = nullptr;
+  unsigned short* d_bndTypes = nullptr;
+  double* d_bndParams = nullptr;
+  cudaError_t err = cudaSuccess;
+
+  const size_t offsetsBytes = (nPoint + 1) * sizeof(unsigned long);
+  const unsigned long edgeListSize = h_nodeEdgeOffsets[nPoint];
+  const size_t nodeEdgesBytes = static_cast<size_t>(edgeListSize) * sizeof(unsigned long);
+  const size_t edgesBytes = nEdge * sizeof(unsigned long);
+  const size_t normalsBytes = nEdge * 3 * sizeof(double);
+  const size_t solBytes = static_cast<size_t>(nPoint) * nVar * sizeof(double);
+  const size_t gradBytes = static_cast<size_t>(nPoint) * 9 * sizeof(double);
+  const size_t dtBytes = static_cast<size_t>(nPoint) * sizeof(double);
+  const size_t volBytes = static_cast<size_t>(nPoint) * sizeof(double);
+  const size_t resBytes = static_cast<size_t>(nPoint) * nVar * sizeof(double);
+  const size_t bndOffsetsBytes = (nPoint + 1) * sizeof(unsigned long);
+  const size_t bndNormalsBytes = static_cast<size_t>(nBnd) * 3 * sizeof(double);
+  const size_t bndTypesBytes = static_cast<size_t>(nBnd) * sizeof(unsigned short);
+  const size_t bndParamsBytes = static_cast<size_t>(nBnd) * 5 * sizeof(double);
+
+  err = cudaMalloc(&d_nodeEdgeOffsets, offsetsBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_nodeEdges, nodeEdgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNode0, edgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNode1, edgesBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_edgeNormals, normalsBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_solution, solBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_solution_out, solBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_gradU, gradBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_dt, dtBytes); if (err) goto cleanup;
+  err = cudaMalloc(&d_volume, volBytes); if (err) goto cleanup;
+  if (h_residual_extra) { err = cudaMalloc(&d_res_extra, resBytes); if (err) goto cleanup; }
+  if (h_residual_trunc) { err = cudaMalloc(&d_res_trunc, resBytes); if (err) goto cleanup; }
+  if (h_residual_out) { err = cudaMalloc(&d_residual_out, resBytes); if (err) goto cleanup; }
+  if (h_bndOffsets) { err = cudaMalloc(&d_bndOffsets, bndOffsetsBytes); if (err) goto cleanup; }
+  if (nBnd > 0) {
+    if (h_bndNormals) { err = cudaMalloc(&d_bndNormals, bndNormalsBytes); if (err) goto cleanup; }
+    if (h_bndTypes) { err = cudaMalloc(&d_bndTypes, bndTypesBytes); if (err) goto cleanup; }
+    if (h_bndParams) { err = cudaMalloc(&d_bndParams, bndParamsBytes); if (err) goto cleanup; }
+  }
+
+  err = cudaMemcpyAsync(d_nodeEdgeOffsets, h_nodeEdgeOffsets, offsetsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_nodeEdges, h_nodeEdges, nodeEdgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNode0, h_edgeNode0, edgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNode1, h_edgeNode1, edgesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_edgeNormals, h_edgeNormals, normalsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_solution, h_solution, solBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_gradU, h_gradU, gradBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_dt, h_dt, dtBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  err = cudaMemcpyAsync(d_volume, h_volume, volBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  if (h_residual_extra) {
+    err = cudaMemcpyAsync(d_res_extra, h_residual_extra, resBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+  if (h_residual_trunc) {
+    err = cudaMemcpyAsync(d_res_trunc, h_residual_trunc, resBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+  if (h_bndOffsets) {
+    err = cudaMemcpyAsync(d_bndOffsets, h_bndOffsets, bndOffsetsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup;
+  }
+  if (nBnd > 0) {
+    if (h_bndNormals) { err = cudaMemcpyAsync(d_bndNormals, h_bndNormals, bndNormalsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup; }
+    if (h_bndTypes) { err = cudaMemcpyAsync(d_bndTypes, h_bndTypes, bndTypesBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup; }
+    if (h_bndParams) { err = cudaMemcpyAsync(d_bndParams, h_bndParams, bndParamsBytes, cudaMemcpyHostToDevice, stream); if (err) goto cleanup; }
+  }
+
+  {
+    const int block = 256;
+    const int grid = static_cast<int>((nPointDomain + block - 1) / block);
+    double* d_in = d_solution;
+    double* d_out = d_solution_out;
+    double* d_final = d_solution;
+    for (unsigned long iter = 0; iter < nIter; ++iter) {
+      const bool last = (iter + 1 == nIter);
+      RoeNSNodeUpdateKernel<<<grid, block, 0, stream>>>(d_nodeEdgeOffsets, d_nodeEdges,
+                                                        d_edgeNode0, d_edgeNode1, d_edgeNormals,
+                                                        d_in, d_gradU, d_dt, d_volume,
+                                                        d_res_extra, d_res_trunc,
+                                                        d_bndOffsets, d_bndNormals, d_bndTypes, d_bndParams,
+                                                        mu, d_out, last ? d_residual_out : nullptr,
+                                                        nPointDomain, nPoint, nVar, nDim, gamma);
+      err = cudaGetLastError();
+      if (err != cudaSuccess) goto cleanup;
+      d_final = d_out;
+      double* tmp = d_in;
+      d_in = d_out;
+      d_out = tmp;
+    }
+    d_solution_out = d_final;
   }
 
   err = cudaMemcpyAsync(h_solution_out, d_solution_out, solBytes, cudaMemcpyDeviceToHost, stream); if (err) goto cleanup;

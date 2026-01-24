@@ -38,35 +38,6 @@ bool HasMarkerKind(const CConfig* config, unsigned short kind) {
   }
   return false;
 }
-
-bool UseGPUNodeUpdateNS(const CNSSolver* solver, const CConfig* config) {
-  const bool ideal_gas = (config->GetKind_FluidModel() == STANDARD_AIR) ||
-                         (config->GetKind_FluidModel() == IDEAL_GAS);
-  const bool low_mach_corr = config->Low_Mach_Correction();
-  const bool muscl = config->GetMUSCL_Flow();
-  const bool limiter = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
-  const bool has_inlet = HasMarkerKind(config, INLET_FLOW);
-  const bool inlet_ok = !has_inlet || (config->GetKind_Inlet() == INLET_TYPE::VELOCITY_INLET);
-
-  return config->GetCUDA() &&
-         config->GetViscous() &&
-         (config->GetKind_ConvNumScheme() == SPACE_UPWIND) &&
-         (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
-         ideal_gas && !low_mach_corr &&
-         !solver->dynamic_grid &&
-         !solver->ReducerStrategy &&
-         !muscl && !limiter &&
-         inlet_ok &&
-         (config->GetKind_Turb_Model() == TURB_MODEL::NONE) &&
-         (config->GetKind_ViscosityModel() == VISCOSITYMODEL::CONSTANT) &&
-         !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint() &&
-         !config->GetRotating_Frame() &&
-         !config->GetAxisymmetric() &&
-         (config->GetGravityForce() == NO) &&
-         !config->GetBody_Force() &&
-         config->GetEnergy_Equation() &&
-         (solver->nDim == 3);
-}
 } // namespace
 
 /*--- Explicit instantiation of the parent class of CEulerSolver,
@@ -104,6 +75,36 @@ CNSSolver::CNSSolver(CGeometry *geometry, CConfig *config, unsigned short iMesh)
       break;
   }
 
+}
+
+bool CNSSolver::UseGPUNodeUpdateNS(const CConfig* config) const {
+  const bool ideal_gas = (config->GetKind_FluidModel() == STANDARD_AIR) ||
+                         (config->GetKind_FluidModel() == IDEAL_GAS);
+  const bool low_mach_corr = config->Low_Mach_Correction();
+  const bool muscl = config->GetMUSCL_Flow();
+  const bool limiter = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
+  const bool has_inlet = HasMarkerKind(config, INLET_FLOW);
+  const bool inlet_ok = !has_inlet || (config->GetKind_Inlet() == INLET_TYPE::VELOCITY_INLET);
+  const bool grid_movement = config->GetGrid_Movement() || config->GetDeform_Mesh();
+
+  return config->GetCUDA() &&
+         config->GetViscous() &&
+         (config->GetKind_ConvNumScheme() == SPACE_UPWIND) &&
+         (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
+         ideal_gas && !low_mach_corr &&
+         !grid_movement &&
+         !ReducerStrategy &&
+         !muscl && !limiter &&
+         inlet_ok &&
+         (config->GetKind_Turb_Model() == TURB_MODEL::NONE) &&
+         (config->GetKind_ViscosityModel() == VISCOSITYMODEL::CONSTANT) &&
+         !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint() &&
+         !config->GetRotating_Frame() &&
+         !config->GetAxisymmetric() &&
+         (config->GetGravityForce() == NO) &&
+         !config->GetBody_Force() &&
+         config->GetEnergy_Equation() &&
+         (nDim == 3);
 }
 
 void CNSSolver::Preprocessing(CGeometry *geometry, CSolver **solver_container, CConfig *config, unsigned short iMesh,
@@ -166,7 +167,7 @@ void CNSSolver::Preprocessing(CGeometry *geometry, CSolver **solver_container, C
 
 void CNSSolver::ExplicitEuler_Iteration(CGeometry *geometry, CSolver **solver_container, CConfig *config) {
 
-  const bool use_gpu_update = UseGPUNodeUpdateNS(this, config);
+  const bool use_gpu_update = UseGPUNodeUpdateNS(config);
 
 #ifdef HAVE_CUDA
   if (use_gpu_update) {
@@ -316,16 +317,17 @@ void CNSSolver::ExplicitEuler_Iteration(CGeometry *geometry, CSolver **solver_co
     const su2double mu = config->GetViscosity_FreeStreamND();
 
     AD::StartNoSharedReading();
-    cudaError_t err = ComputeNSRoeUpdateHost(h_off.data(), h_edges.data(),
-                                             h_e0.data(), h_e1.data(),
-                                             h_normal.data(), h_solution.data(),
-                                             h_grad_u.data(), h_dt.data(), h_volume.data(),
-                                             h_residual_extra.data(), h_residual_trunc.data(),
-                                             h_bnd_offsets.data(), h_bnd_normals.data(),
-                                             h_bnd_types.data(), h_bnd_params.data(),
-                                             nPointDomain, nPoint, nEdge, nBnd, nVar, nDim,
-                                             Gamma, mu, h_solution_out.data(),
-                                             h_residual_out.data(), 0);
+    const unsigned long nIterGPU = 50000;
+    cudaError_t err = ComputeNSRoeUpdateLoopHost(h_off.data(), h_edges.data(),
+                                                 h_e0.data(), h_e1.data(),
+                                                 h_normal.data(), h_solution.data(),
+                                                 h_grad_u.data(), h_dt.data(), h_volume.data(),
+                                                 h_residual_extra.data(), h_residual_trunc.data(),
+                                                 h_bnd_offsets.data(), h_bnd_normals.data(),
+                                                 h_bnd_types.data(), h_bnd_params.data(),
+                                                 nPointDomain, nPoint, nEdge, nBnd, nVar, nDim,
+                                                 Gamma, mu, nIterGPU, h_solution_out.data(),
+                                                 h_residual_out.data(), 0);
     if (err != cudaSuccess) {
       AD::EndNoSharedReading();
       SU2_MPI::Error("GPU NS Roe update computation failed.", CURRENT_FUNCTION);
@@ -366,37 +368,37 @@ void CNSSolver::ExplicitEuler_Iteration(CGeometry *geometry, CSolver **solver_co
 
 void CNSSolver::Upwind_Residual(CGeometry *geometry, CSolver **solver_container, CNumerics **numerics_container,
                                 CConfig *config, unsigned short iMesh) {
-  if (UseGPUNodeUpdateNS(this, config)) return;
+  if (UseGPUNodeUpdateNS(config)) return;
   CEulerSolver::Upwind_Residual(geometry, solver_container, numerics_container, config, iMesh);
 }
 
 void CNSSolver::BC_Far_Field(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
                              CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
-  if (UseGPUNodeUpdateNS(this, config)) return;
+  if (UseGPUNodeUpdateNS(config)) return;
   CEulerSolver::BC_Far_Field(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
 }
 
 void CNSSolver::BC_Inlet(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
                          CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
-  if (UseGPUNodeUpdateNS(this, config)) return;
+  if (UseGPUNodeUpdateNS(config)) return;
   CEulerSolver::BC_Inlet(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
 }
 
 void CNSSolver::BC_Outlet(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
                           CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
-  if (UseGPUNodeUpdateNS(this, config)) return;
+  if (UseGPUNodeUpdateNS(config)) return;
   CEulerSolver::BC_Outlet(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
 }
 
 void CNSSolver::BC_Sym_Plane(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
                              CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
-  if (UseGPUNodeUpdateNS(this, config)) return;
+  if (UseGPUNodeUpdateNS(config)) return;
   CEulerSolver::BC_Sym_Plane(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
 }
 
 void CNSSolver::BC_Euler_Wall(CGeometry *geometry, CSolver **solver_container, CNumerics *conv_numerics,
                               CNumerics *visc_numerics, CConfig *config, unsigned short val_marker) {
-  if (UseGPUNodeUpdateNS(this, config)) return;
+  if (UseGPUNodeUpdateNS(config)) return;
   CEulerSolver::BC_Euler_Wall(geometry, solver_container, conv_numerics, visc_numerics, config, val_marker);
 }
 

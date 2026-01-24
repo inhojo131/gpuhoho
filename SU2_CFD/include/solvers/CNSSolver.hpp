@@ -44,6 +44,11 @@ private:
   su2double Total_Buffet_Metric = 0.0;      /*!< \brief Integrated separation sensor for all the boundaries. */
 
   /*!
+   * \brief Check whether the GPU node update path is active.
+   */
+  bool UseGPUNodeUpdateNS(const CConfig* config) const;
+
+  /*!
    * \brief A virtual member.
    * \param[in] geometry - Geometrical definition.
    * \param[in] config - Definition of the particular problem.

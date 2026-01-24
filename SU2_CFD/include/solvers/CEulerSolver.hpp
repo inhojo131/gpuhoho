@@ -367,7 +367,7 @@ public:
                        CSolver **solver_container,
                        CNumerics **numerics_container,
                        CConfig *config,
-                       unsigned short iMesh) final;
+                       unsigned short iMesh) override;
 
   /*!
    * \brief Recompute the extrapolated quantities, after MUSCL reconstruction,
@@ -476,7 +476,7 @@ public:
                     CNumerics *conv_numerics,
                     CNumerics *visc_numerics,
                     CConfig *config,
-                    unsigned short val_marker) final;
+                    unsigned short val_marker) override;
 
   /*!
    * \brief Impose the engine inflow boundary condition.
@@ -624,7 +624,7 @@ public:
                 CNumerics *conv_numerics,
                 CNumerics *visc_numerics,
                 CConfig *config,
-                unsigned short val_marker) final;
+                unsigned short val_marker) override;
 
   /*!
    * \brief Impose a supersonic inlet boundary condition.
@@ -672,7 +672,7 @@ public:
                  CNumerics *conv_numerics,
                  CNumerics *visc_numerics,
                  CConfig *config,
-                 unsigned short val_marker) final;
+                 unsigned short val_marker) override;
 
   /*!
    * \brief Impose the nacelle inflow boundary condition.
@@ -776,7 +776,7 @@ public:
    */
   void ExplicitEuler_Iteration(CGeometry *geometry,
                                CSolver **solver_container,
-                               CConfig *config) final;
+                               CConfig *config) override;
 
   /*!
    * \brief Prepare an implicit iteration.
