@@ -87,24 +87,27 @@ bool CNSSolver::UseGPUNodeUpdateNS(const CConfig* config) const {
   const bool inlet_ok = !has_inlet || (config->GetKind_Inlet() == INLET_TYPE::VELOCITY_INLET);
   const bool grid_movement = config->GetGrid_Movement() || config->GetDeform_Mesh();
 
-  return config->GetCUDA() &&
-         config->GetViscous() &&
-         (config->GetKind_ConvNumScheme() == SPACE_UPWIND) &&
-         (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
-         ideal_gas && !low_mach_corr &&
-         !grid_movement &&
-         !ReducerStrategy &&
-         !muscl && !limiter &&
-         inlet_ok &&
-         (config->GetKind_Turb_Model() == TURB_MODEL::NONE) &&
-         (config->GetKind_ViscosityModel() == VISCOSITYMODEL::CONSTANT) &&
-         !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint() &&
-         !config->GetRotating_Frame() &&
-         !config->GetAxisymmetric() &&
-         (config->GetGravityForce() == NO) &&
-         !config->GetBody_Force() &&
-         config->GetEnergy_Equation() &&
-         (nDim == 3);
+  const bool gpu_update_supported = config->GetCUDA() &&
+                                    config->GetViscous() &&
+                                    (config->GetKind_ConvNumScheme() == SPACE_UPWIND) &&
+                                    (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
+                                    ideal_gas && !low_mach_corr &&
+                                    !grid_movement &&
+                                    !ReducerStrategy &&
+                                    !muscl && !limiter &&
+                                    inlet_ok &&
+                                    (config->GetKind_Turb_Model() == TURB_MODEL::NONE) &&
+                                    (config->GetKind_ViscosityModel() == VISCOSITYMODEL::CONSTANT) &&
+                                    !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint() &&
+                                    !config->GetRotating_Frame() &&
+                                    !config->GetAxisymmetric() &&
+                                    (config->GetGravityForce() == NO) &&
+                                    !config->GetBody_Force() &&
+                                    config->GetEnergy_Equation() &&
+                                    (nDim == 3);
+
+  /* Explicit Euler CUDA space-integration path is intentionally disabled. */
+  return false && gpu_update_supported;
 }
 
 void CNSSolver::Preprocessing(CGeometry *geometry, CSolver **solver_container, CConfig *config, unsigned short iMesh,

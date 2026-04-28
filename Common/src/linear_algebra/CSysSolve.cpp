@@ -35,6 +35,11 @@
 #include "../../include/linear_algebra/CPreconditioner.hpp"
 
 #include <limits>
+#include <sstream>
+
+#ifdef HAVE_AMGX
+#include <amgx_c.h>
+#endif
 
 /*!
  * \brief Epsilon used in CSysSolve depending on datatype to
@@ -50,6 +55,40 @@ constexpr float linSolEpsilon<float>() {
   return 1e-12;
 }
 }  // namespace
+
+#ifdef HAVE_AMGX
+namespace {
+template <class T>
+AMGX_Mode AMGXMode();
+
+template <>
+AMGX_Mode AMGXMode<su2double>() {
+  return AMGX_mode_dDDI;
+}
+
+template <>
+AMGX_Mode AMGXMode<float>() {
+  return AMGX_mode_dFFI;
+}
+
+void SilentAMGXPrintCallback(const char*, int) {}
+
+class AMGXRuntime {
+ public:
+  AMGXRuntime() {
+    AMGX_SAFE_CALL(AMGX_initialize());
+    AMGX_SAFE_CALL(AMGX_initialize_plugins());
+    AMGX_SAFE_CALL(AMGX_register_print_callback(&SilentAMGXPrintCallback));
+    AMGX_SAFE_CALL(AMGX_install_signal_handler());
+  }
+
+  ~AMGXRuntime() {
+    AMGX_finalize_plugins();
+    AMGX_finalize();
+  }
+};
+}  // namespace
+#endif
 
 template <class ScalarType>
 CSysSolve<ScalarType>::CSysSolve(LINEAR_SOLVER_MODE linear_solver_mode)
@@ -610,13 +649,13 @@ unsigned long CSysSolve<ScalarType>::BCGSTAB_LinSolver(const CSysVector<ScalarTy
   }
 
   /*--- Only compute the residuals in full communication mode. ---*/
-
+  //mpi check
   if (config->GetComm_Level() == COMM_FULL) {
     norm_r = r.norm();
     norm0 = b.norm();
 
     /*--- Set the norm to the initial initial residual value ---*/
-
+    // tolerence check
     if (tol_type == LinearToleranceType::RELATIVE) norm0 = norm_r;
 
     if ((norm_r < tol * norm0) || (norm_r < eps)) {
@@ -736,6 +775,202 @@ unsigned long CSysSolve<ScalarType>::BCGSTAB_LinSolver(const CSysVector<ScalarTy
   residual = norm_r / norm0;
   return i;
 }
+
+template <class ScalarType>
+unsigned long CSysSolve<ScalarType>::BCGSTAB_LinSolver_GPU(const CSysVector<ScalarType>& b, CSysVector<ScalarType>& x,
+                                                           CSysMatrix<ScalarType>& Jacobian, ScalarType tol,
+                                                           unsigned long m, ScalarType& residual, bool monitoring,
+                                                           CGeometry* geometry, const CConfig* config) const {
+#ifdef HAVE_CUDA
+  const bool masterRank = true;
+  ScalarType norm_r = 0.0, norm0 = 0.0;
+  unsigned long i = 0;
+
+  if (m < 1) {
+    SU2_MPI::Error("Number of linear solver iterations must be greater than 0.", CURRENT_FUNCTION);
+  }
+
+  if (!bcg_ready) {
+    auto nVar = b.GetNVar();
+    auto nBlk = b.GetNBlk();
+    auto nBlkDomain = b.GetNBlkDomain();
+
+    A_x.Initialize(nBlk, nBlkDomain, nVar, nullptr);
+    r_0.Initialize(nBlk, nBlkDomain, nVar, nullptr);
+    r.Initialize(nBlk, nBlkDomain, nVar, nullptr);
+    p.Initialize(nBlk, nBlkDomain, nVar, nullptr);
+    v.Initialize(nBlk, nBlkDomain, nVar, nullptr);
+    z.Initialize(nBlk, nBlkDomain, nVar, nullptr);
+
+    bcg_ready = true;
+  }
+
+  b.HtDTransfer();
+  x.HtDTransfer();
+
+  if (!xIsZero) {
+    Jacobian.GPUMatrixVectorProduct(x, A_x, geometry, config, false);
+    r.GPUCopyFrom(b);
+    r.GPUAXPY(ScalarType(-1), A_x);
+  } else {
+    r.GPUCopyFrom(b);
+  }
+
+  norm_r = sqrt(r.GPUDot(r));
+  norm0 = sqrt(b.GPUDot(b));
+
+  if (tol_type == LinearToleranceType::RELATIVE) norm0 = norm_r;
+
+  ScalarType alpha = 1.0, omega = 1.0, rho = 1.0, rho_prime = 1.0;
+  p.GPUSetVal(0.0);
+  v.GPUSetVal(0.0);
+  r_0.GPUCopyFrom(r);
+
+  for (i = 0; i < m; i++) {
+    rho_prime = rho;
+    rho = r.GPUDot(r_0);
+    if (fabs(rho) < eps) break;
+
+    ScalarType beta = (rho / rho_prime) * (alpha / omega);
+    p.GPUUpdateP(v, r, beta, omega);
+
+    Jacobian.ComputeJacobiPreconditionerGPU(p, z);
+    Jacobian.GPUMatrixVectorProduct(z, v, geometry, config, false);
+
+    ScalarType r_0_v = r_0.GPUDot(v);
+    if (fabs(r_0_v) < eps) break;
+    alpha = rho / r_0_v;
+
+    x.GPUAXPY(alpha, z);
+    r.GPUAXPY(-alpha, v);
+
+    Jacobian.ComputeJacobiPreconditionerGPU(r, z);
+    Jacobian.GPUMatrixVectorProduct(z, A_x, geometry, config, false);
+
+    ScalarType A_x_sq = A_x.GPUDot(A_x);
+    if (A_x_sq == ScalarType(0)) break;
+    omega = A_x.GPUDot(r) / A_x_sq;
+
+    x.GPUAXPY(omega, z);
+    r.GPUAXPY(-omega, A_x);
+
+    norm_r = sqrt(r.GPUDot(r));
+    if (norm_r < tol * norm0) break;
+  }
+  residual = norm_r / norm0;
+  x.DtHTransfer();
+  return i;
+#else
+  (void)b;
+  (void)x;
+  (void)Jacobian;
+  (void)tol;
+  (void)m;
+  (void)residual;
+  (void)monitoring;
+  (void)geometry;
+  (void)config;
+  SU2_MPI::Error("BCGSTAB_LinSolver_GPU requires CUDA support.", CURRENT_FUNCTION);
+  return 0;
+#endif
+}
+
+template <class ScalarType>
+unsigned long CSysSolve<ScalarType>::AMGX_LinSolver(const CSysVector<ScalarType>& b, CSysVector<ScalarType>& x,
+                                                    CSysMatrix<ScalarType>& Jacobian, ScalarType tol, unsigned long m,
+                                                    bool monitoring, CGeometry* geometry,
+                                                    const CConfig* config) const {
+#ifdef HAVE_AMGX
+  if (m < 1) {
+    SU2_MPI::Error("Number of linear solver iterations must be greater than 0.", CURRENT_FUNCTION);
+  } // Require at least one AmgX main-solver iteration.
+
+  if (SU2_MPI::GetSize() != 1) {
+    SU2_MPI::Error("AMGX_LinSolver currently supports single-rank execution only.", CURRENT_FUNCTION);
+  } // This AmgX wrapper currently supports only single-rank runs.
+
+  if (Jacobian.GetNVar() != Jacobian.GetNEqn()) {
+    SU2_MPI::Error("AMGX_LinSolver requires square block matrices.", CURRENT_FUNCTION);
+  } // Require square matrix blocks for the AmgX linear system.
+
+  const auto n = static_cast<int>(Jacobian.GetNPointDomain());
+  const auto nnz = static_cast<int>(Jacobian.GetNNZ());
+  const auto block_dimx = static_cast<int>(Jacobian.GetNVar());
+  const auto block_dimy = static_cast<int>(Jacobian.GetNEqn());
+  std::vector<int> row_ptr(static_cast<size_t>(n) + 1);
+  std::vector<int> col_ind(static_cast<size_t>(nnz));
+  for (int i = 0; i < n + 1; ++i) row_ptr[i] = static_cast<int>(Jacobian.GetRowPtr()[i]);
+  for (int i = 0; i < nnz; ++i) col_ind[i] = static_cast<int>(Jacobian.GetColInd()[i]);
+  const auto* values = Jacobian.GetMatrixValues();
+  const auto* rhs_ptr = b.begin();
+
+  const auto mode = AMGXMode<ScalarType>();
+
+  std::ostringstream cfg_stream;
+  cfg_stream << "config_version=2, "
+             << "solver(main)=FGMRES, "
+             << "main:preconditioner(amg)=AMG, "
+             << "main:max_iters=" << m << ", "
+             << "main:tolerance=" << tol << ", "
+             << "main:monitor_residual=0, "
+             << "main:print_solve_stats=0, "
+             << "amg:algorithm=AGGREGATION, "
+             << "amg:max_iters=1, "
+             << "amg:presweeps=1, "
+             << "amg:postsweeps=1, "
+             << "amg:selector=SIZE_2";
+
+  AMGX_config_handle cfg_handle;
+  AMGX_resources_handle rsrc_handle;
+  AMGX_matrix_handle A_handle;
+  AMGX_vector_handle b_handle, x_handle;
+  AMGX_solver_handle solver_handle;
+  static const AMGXRuntime amgx_runtime;
+  (void)amgx_runtime;
+
+  AMGX_SAFE_CALL(AMGX_config_create(&cfg_handle, cfg_stream.str().c_str()));
+  AMGX_SAFE_CALL(AMGX_resources_create_simple(&rsrc_handle, cfg_handle));
+  AMGX_SAFE_CALL(AMGX_matrix_create(&A_handle, rsrc_handle, mode));
+  AMGX_SAFE_CALL(AMGX_vector_create(&b_handle, rsrc_handle, mode));
+  AMGX_SAFE_CALL(AMGX_vector_create(&x_handle, rsrc_handle, mode));
+  AMGX_SAFE_CALL(AMGX_solver_create(&solver_handle, rsrc_handle, mode, cfg_handle));
+
+  AMGX_SAFE_CALL(
+      AMGX_matrix_upload_all(A_handle, n, nnz, block_dimx, block_dimy, row_ptr.data(), col_ind.data(), values, nullptr));
+  AMGX_SAFE_CALL(AMGX_vector_upload(b_handle, n, block_dimy, rhs_ptr));
+  AMGX_SAFE_CALL(AMGX_vector_upload(x_handle, n, block_dimx, &x[0]));
+
+  AMGX_SAFE_CALL(AMGX_solver_setup(solver_handle, A_handle));
+  AMGX_SAFE_CALL(AMGX_solver_solve(solver_handle, b_handle, x_handle));
+  AMGX_SAFE_CALL(AMGX_vector_download(x_handle, &x[0]));
+
+  AMGX_SOLVE_STATUS status = AMGX_SOLVE_FAILED;
+  AMGX_SAFE_CALL(AMGX_solver_get_status(solver_handle, &status));
+  int num_iters = 0;
+  AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(solver_handle, &num_iters));
+
+  AMGX_SAFE_CALL(AMGX_solver_destroy(solver_handle));
+  AMGX_SAFE_CALL(AMGX_vector_destroy(x_handle));
+  AMGX_SAFE_CALL(AMGX_vector_destroy(b_handle));
+  AMGX_SAFE_CALL(AMGX_matrix_destroy(A_handle));
+  AMGX_SAFE_CALL(AMGX_resources_destroy(rsrc_handle));
+  AMGX_SAFE_CALL(AMGX_config_destroy(cfg_handle));
+
+  return (status == AMGX_SOLVE_SUCCESS) ? static_cast<unsigned long>(num_iters) : 0ul;
+#else
+  (void)b;
+  (void)x;
+  (void)Jacobian;
+  (void)tol;
+  (void)m;
+  (void)monitoring;
+  (void)geometry;
+  (void)config;
+  SU2_MPI::Error("AMGX_LinSolver requires a build with HAVE_AMGX enabled.", CURRENT_FUNCTION);
+  return 0;
+#endif
+}
+
 
 template <class ScalarType>
 unsigned long CSysSolve<ScalarType>::Smoother_LinSolver(const CSysVector<ScalarType>& b, CSysVector<ScalarType>& x,
@@ -946,24 +1181,34 @@ unsigned long CSysSolve<ScalarType>::Solve(CSysMatrix<ScalarType>& Jacobian, con
 
     HandleTemporariesIn(LinSysRes, LinSysSol);
 
-    auto mat_vec = CSysMatrixVectorProduct<ScalarType>(Jacobian, geometry, config);
-
     const auto kindPrec = static_cast<ENUM_LINEAR_SOLVER_PREC>(KindPrecond);
+    auto mat_vec = CSysMatrixVectorProduct<ScalarType>(Jacobian, geometry, config);
+    std::unique_ptr<CPreconditioner<ScalarType>> precond;
 
-    auto precond = CPreconditioner<ScalarType>::Create(kindPrec, Jacobian, geometry, config);
-
-    /*--- Build preconditioner. ---*/
-
-    precond->Build();
+    if (KindSolver != AMGX) {
+      precond.reset(CPreconditioner<ScalarType>::Create(kindPrec, Jacobian, geometry, config));
+      precond->Build();
+    }
 
     /*--- Solve system. ---*/
 
-    ScalarType residual = 0.0;
+    ScalarType residual = Residual;
+    bool updateResidual = true;
 
     switch (KindSolver) {
       case BCGSTAB:
-        IterLinSol = BCGSTAB_LinSolver(*LinSysRes_ptr, *LinSysSol_ptr, mat_vec, *precond, SolverTol, MaxIter, residual,
-                                       ScreenOutput, config);
+        if (config->GetCUDA() && kindPrec == JACOBI && SU2_MPI::GetSize() == 1) {
+          IterLinSol = BCGSTAB_LinSolver_GPU(*LinSysRes_ptr, *LinSysSol_ptr, Jacobian, SolverTol, MaxIter, residual,
+                                             ScreenOutput, geometry, config);
+        } else {
+          IterLinSol = BCGSTAB_LinSolver(*LinSysRes_ptr, *LinSysSol_ptr, mat_vec, *precond, SolverTol, MaxIter,
+                                         residual, ScreenOutput, config);
+        }
+        break;
+      case AMGX:
+        IterLinSol = AMGX_LinSolver(*LinSysRes_ptr, *LinSysSol_ptr, Jacobian, SolverTol, MaxIter, ScreenOutput,
+                           geometry, config);
+        updateResidual = false;
         break;
       case FGMRES:
         IterLinSol = FGMRES_LinSolver(*LinSysRes_ptr, *LinSysSol_ptr, mat_vec, *precond, SolverTol, MaxIter, residual,
@@ -993,14 +1238,12 @@ unsigned long CSysSolve<ScalarType>::Solve(CSysMatrix<ScalarType>& Jacobian, con
     }
 
     SU2_OMP_MASTER {
-      Residual = residual;
+      if (updateResidual) Residual = residual;
       Iterations = IterLinSol;
     }
     END_SU2_OMP_MASTER
 
     HandleTemporariesOut(LinSysSol);
-
-    delete precond;
 
     if (TapeActive) {
       /*--- To keep the behavior of SU2_DOT, but not strictly required since jacobian is symmetric(?). ---*/
@@ -1101,11 +1344,14 @@ unsigned long CSysSolve<ScalarType>::Solve_b(CSysMatrix<ScalarType>& Jacobian, c
   /*--- Set up preconditioner and matrix-vector product ---*/
 
   const auto kindPrec = static_cast<ENUM_LINEAR_SOLVER_PREC>(KindPrecond);
-
-  auto precond = CPreconditioner<ScalarType>::Create(kindPrec, Jacobian, geometry, config);
+  std::unique_ptr<CPreconditioner<ScalarType>> precond;
 
   /*--- If there was no call to solve first the preconditioner needs to be built here. ---*/
-  if (directCall) {
+  if (KindSolver != AMGX) {
+    precond.reset(CPreconditioner<ScalarType>::Create(kindPrec, Jacobian, geometry, config));
+  }
+
+  if (directCall && precond) {
     Jacobian.TransposeInPlace();
     precond->Build();
   }
@@ -1132,6 +1378,9 @@ unsigned long CSysSolve<ScalarType>::Solve_b(CSysMatrix<ScalarType>& Jacobian, c
       IterLinSol = BCGSTAB_LinSolver(*LinSysRes_ptr, *LinSysSol_ptr, mat_vec, *precond, SolverTol, MaxIter, residual,
                                      ScreenOutput, config);
       break;
+    case AMGX:
+      SU2_MPI::Error("AMGX linear solver is not implemented in Solve_b.", CURRENT_FUNCTION);
+      break;
     case CONJUGATE_GRADIENT:
       IterLinSol = CG_LinSolver(*LinSysRes_ptr, *LinSysSol_ptr, mat_vec, *precond, SolverTol, MaxIter, residual,
                                 ScreenOutput, config);
@@ -1153,8 +1402,6 @@ unsigned long CSysSolve<ScalarType>::Solve_b(CSysMatrix<ScalarType>& Jacobian, c
   }
 
   HandleTemporariesOut(LinSysSol);
-
-  delete precond;
 
   SU2_OMP_MASTER {
     Residual = residual;

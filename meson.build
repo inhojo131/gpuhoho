@@ -227,6 +227,30 @@ if get_option('enable-cuda')
   su2_deps += gpu_dep
 endif
 
+# AMGX dependencies
+if get_option('enable-amgx')
+  if not get_option('enable-cuda')
+    error('AMGX support requires enable-cuda=true')
+  endif
+
+  su2_cpp_args += '-DHAVE_AMGX'
+
+  amgx_root = get_option('amgx_root')
+  amgx_libdir = get_option('amgx_libdir')
+  amgx_include_dir = amgx_root + '/include'
+  if not fsmod.is_dir(amgx_include_dir)
+    amgx_include_dir = amgx_root + '/base/include'
+  endif
+  if not fsmod.is_dir(amgx_include_dir)
+    error('AMGX headers not found. Expected either ' + amgx_root + '/include or ' + amgx_root + '/base/include')
+  endif
+  amgx_dep = declare_dependency(
+    include_directories: include_directories(amgx_include_dir),
+    link_args: ['-L' + amgx_root + '/' + amgx_libdir, '-lamgxsh']
+  )
+  su2_deps += amgx_dep
+endif
+
 # blas-type dependencies
 if get_option('enable-mkl')
 

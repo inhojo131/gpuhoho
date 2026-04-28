@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <string>
+#include <memory>
 
 #include "CSysVector.hpp"
 #include "../option_structure.hpp"
@@ -348,6 +349,20 @@ class CSysSolve {
   unsigned long BCGSTAB_LinSolver(const VectorType& b, VectorType& x, const ProductType& mat_vec,
                                   const PrecondType& precond, ScalarType tol, unsigned long m, ScalarType& residual,
                                   bool monitoring, const CConfig* config) const;
+
+  /*!
+   * \brief GPU-enabled BCGSTAB driver.
+   */
+  unsigned long BCGSTAB_LinSolver_GPU(const VectorType& b, VectorType& x, MatrixType& Jacobian, ScalarType tol,
+                                      unsigned long m, ScalarType& residual, bool monitoring, CGeometry* geometry,
+                                      const CConfig* config) const;
+
+  /*!
+   * \brief AMGX-backed GPU linear solver driver.
+   */
+  unsigned long AMGX_LinSolver(const VectorType& b, VectorType& x, MatrixType& Jacobian, ScalarType tol,
+                               unsigned long m, bool monitoring, CGeometry* geometry,
+                               const CConfig* config) const;
 
   /*!
    * \brief Generic smoother (modified Richardson iteration with preconditioner)

@@ -399,9 +399,20 @@ class CSysMatrix {
 
   /*!
    * \brief Performs the memory copy from host to device.
-   * \param[in] trigger - boolean value that decides whether to conduct the transfer or not. True by default.
    */
-  void HtDTransfer(bool trigger = true) const;
+  void HtDTransfer() const;
+
+  /*!
+   * \brief Raw sparse matrix accessors, primarily for external linear solver wrappers.
+   */
+  inline const ScalarType* GetMatrixValues() const { return matrix; }
+  inline const unsigned long* GetRowPtr() const { return row_ptr; }
+  inline const unsigned long* GetColInd() const { return col_ind; }
+  inline unsigned long GetNNZ() const { return nnz; }
+  inline unsigned long GetNPoint() const { return nPoint; }
+  inline unsigned long GetNPointDomain() const { return nPointDomain; }
+  inline unsigned long GetNVar() const { return nVar; }
+  inline unsigned long GetNEqn() const { return nEqn; }
 
   /*!
    * \brief Get a pointer to the start of block "ij"
@@ -872,7 +883,7 @@ class CSysMatrix {
    * \param[out] prod - Result of the product.
    */
   void GPUMatrixVectorProduct(const CSysVector<ScalarType>& vec, CSysVector<ScalarType>& prod, CGeometry* geometry,
-                              const CConfig* config) const;
+                              const CConfig* config, bool copy_vec_to_device = true) const;
 
   /*!
    * \brief Performs first step of the LU_SGS Preconditioner building
@@ -921,6 +932,11 @@ class CSysMatrix {
    */
   void ComputeJacobiPreconditioner(const CSysVector<ScalarType>& vec, CSysVector<ScalarType>& prod, CGeometry* geometry,
                                    const CConfig* config) const;
+
+  /*!
+   * \brief Multiply CSysVector by the Jacobi preconditioner on the GPU.
+   */
+  void ComputeJacobiPreconditionerGPU(const CSysVector<ScalarType>& vec, CSysVector<ScalarType>& prod) const;
 
   /*!
    * \brief Build the ILU preconditioner.

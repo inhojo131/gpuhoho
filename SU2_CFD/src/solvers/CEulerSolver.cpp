@@ -1773,13 +1773,15 @@ void CEulerSolver::Upwind_Residual(CGeometry *geometry, CSolver **solver_contain
   const bool limiter = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
   const bool is_explicit_euler = (config->GetKind_TimeIntScheme() == EULER_EXPLICIT);
   /* GPU path: 1st-order Roe, inviscid, explicit, no reconstruction/limiters. */
-  const bool use_gpu_update = config->GetCUDA() &&
-                              (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
-                              ideal_gas && !low_mach_corr &&
-                              !dynamic_grid && !config->GetViscous() &&
-                              is_explicit_euler && !ReducerStrategy &&
-                              !muscl && !limiter &&
-                              !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint();
+  const bool gpu_update_supported = config->GetCUDA() &&
+                                    (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
+                                    ideal_gas && !low_mach_corr &&
+                                    !dynamic_grid && !config->GetViscous() &&
+                                    is_explicit_euler && !ReducerStrategy &&
+                                    !muscl && !limiter &&
+                                    !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint();
+  /* Explicit Euler CUDA space-integration path is intentionally disabled. */
+  const bool use_gpu_update = false && gpu_update_supported;
 
 #ifdef HAVE_CUDA
   if (use_gpu_update) {
@@ -2467,13 +2469,15 @@ void CEulerSolver::ExplicitEuler_Iteration(CGeometry *geometry, CSolver **solver
   const bool low_mach_corr = config->Low_Mach_Correction();
   const bool muscl = config->GetMUSCL_Flow();
   const bool limiter = (config->GetKind_SlopeLimit_Flow() != LIMITER::NONE);
-  const bool use_gpu_update = config->GetCUDA() &&
-                              (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
-                              ideal_gas && !low_mach_corr &&
-                              !dynamic_grid && !config->GetViscous() &&
-                              !ReducerStrategy &&
-                              !muscl && !limiter &&
-                              !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint();
+  const bool gpu_update_supported = config->GetCUDA() &&
+                                    (config->GetKind_Upwind_Flow() == UPWIND::ROE) &&
+                                    ideal_gas && !low_mach_corr &&
+                                    !dynamic_grid && !config->GetViscous() &&
+                                    !ReducerStrategy &&
+                                    !muscl && !limiter &&
+                                    !config->GetContinuous_Adjoint() && !config->GetDiscrete_Adjoint();
+  /* Explicit Euler CUDA space-integration path is intentionally disabled. */
+  const bool use_gpu_update = false && gpu_update_supported;
 
 #ifdef HAVE_CUDA
   if (use_gpu_update) {

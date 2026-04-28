@@ -7228,17 +7228,24 @@ void CConfig::SetOutput(SU2_COMPONENT val_software, unsigned short val_izone) {
             SU2_MPI::Error("Implicit time scheme is not yet implemented with Mutation++. Use EULER_EXPLICIT.", CURRENT_FUNCTION);
           switch (Kind_Linear_Solver) {
             case BCGSTAB:
+            case AMGX:
             case FGMRES:
             case RESTARTED_FGMRES:
               if (Kind_Linear_Solver == BCGSTAB)
                 cout << "BCGSTAB is used for solving the linear system." << endl;
+              else if (Kind_Linear_Solver == AMGX)
+                cout << "AMGX is used for solving the linear system." << endl;
               else
                 cout << "FGMRES is used for solving the linear system." << endl;
-              switch (Kind_Linear_Solver_Prec) {
-                case ILU: cout << "Using a ILU("<< Linear_Solver_ILU_n <<") preconditioning."<< endl; break;
-                case LINELET: cout << "Using a linelet preconditioning."<< endl; break;
-                case LU_SGS:  cout << "Using a LU-SGS preconditioning."<< endl; break;
-                case JACOBI:  cout << "Using a Jacobi preconditioning."<< endl; break;
+              if (Kind_Linear_Solver == AMGX) {
+                cout << "AMGX uses its own internal solver/preconditioner configuration." << endl;
+              } else {
+                switch (Kind_Linear_Solver_Prec) {
+                  case ILU: cout << "Using a ILU("<< Linear_Solver_ILU_n <<") preconditioning."<< endl; break;
+                  case LINELET: cout << "Using a linelet preconditioning."<< endl; break;
+                  case LU_SGS:  cout << "Using a LU-SGS preconditioning."<< endl; break;
+                  case JACOBI:  cout << "Using a Jacobi preconditioning."<< endl; break;
+                }
               }
               break;
             case SMOOTHER:
@@ -7273,6 +7280,11 @@ void CConfig::SetOutput(SU2_COMPONENT val_software, unsigned short val_izone) {
           switch (Kind_Linear_Solver) {
             case BCGSTAB:
               cout << "BCGSTAB is used for solving the linear system." << endl;
+              cout << "Convergence criteria of the linear solver: "<< Linear_Solver_Error <<"."<< endl;
+              cout << "Max number of iterations: "<< Linear_Solver_Iter <<"."<< endl;
+              break;
+            case AMGX:
+              cout << "AMGX is used for solving the linear system." << endl;
               cout << "Convergence criteria of the linear solver: "<< Linear_Solver_Error <<"."<< endl;
               cout << "Max number of iterations: "<< Linear_Solver_Iter <<"."<< endl;
               break;

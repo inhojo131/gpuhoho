@@ -200,21 +200,44 @@ class CSysVector : public VecExpr::CVecExpr<CSysVector<ScalarType>, ScalarType> 
 
   /*!
    * \brief Performs the memory copy from host to device.
-   * \param[in] trigger - boolean value that decides whether to conduct the transfer or not. True by default.
    */
-  void HtDTransfer(bool trigger = true) const;
+  void HtDTransfer() const;
 
   /*!
    * \brief Performs the memory copy from device to host.
-   * \param[in] trigger - boolean value that decides whether to conduct the transfer or not. True by default.
    */
-  void DtHTransfer(bool trigger = true) const;
+  void DtHTransfer() const;
 
   /*!
    * \brief Sets all the elements of the GPU vector to a certain value
-   * \param[in] trigger - boolean value that decides whether to conduct the transfer or not. True by default.
    */
-  void GPUSetVal(ScalarType val, bool trigger = true) const;
+  void GPUSetVal(ScalarType val) const;
+
+  /*!
+   * \brief Copy a device vector into this device vector.
+   */
+  void GPUCopyFrom(const CSysVector<ScalarType>& x) const;
+
+  /*!
+   * \brief Perform y += a*x on device.
+   */
+  void GPUAXPY(ScalarType a, const CSysVector<ScalarType>& x) const;
+
+  /*!
+   * \brief Perform y *= a on device.
+   */
+  void GPUScale(ScalarType a) const;
+
+  /*!
+   * \brief Update search direction p = beta*(p - omega*v) + r on device.
+   */
+  void GPUUpdateP(const CSysVector<ScalarType>& v, const CSysVector<ScalarType>& r, ScalarType beta,
+                  ScalarType omega) const;
+
+  /*!
+   * \brief Compute the dot product on device and return it on host.
+   */
+  ScalarType GPUDot(const CSysVector<ScalarType>& x) const;
 
   /*!
    * \brief return device pointer that points to the CSysVector values in GPU memory
