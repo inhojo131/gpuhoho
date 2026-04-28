@@ -626,6 +626,7 @@ hdf5_conf_data.set('H5_WANT_DCONV_EXCEPTION', 1)
 hdf5_conf_data.set('H5_USE_FILE_LOCKING', 1)
 hdf5_conf_data.set('H5_IGNORE_DISABLED_FILE_LOCKS', 1)
 hdf5_conf_data.set('H5_HAVE_LARGE_HSIZET', 1)
+hdf5_conf_data.set('H5_HAVE_THREADSAFE', 0)
 
 if mpi
   hdf5_conf_data.set('H5_HAVE_PARALLEL', 1)
@@ -633,7 +634,6 @@ if mpi
 else
   threads_dep = dependency('threads')
   ext_deps += threads_dep
-  #hdf5_conf_data.set('H5_HAVE_THREADSAFE', 1) # could be 1 if linux
 endif
 
 hdf5_conf_data.set('H5_USE_112_API_DEFAULT', 1)

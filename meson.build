@@ -69,6 +69,9 @@ mpi = false
 if get_option('custom-mpi')
   mpi_dep = []
   mpi = true
+# If MPI is explicitly disabled, do not auto-enable it just because a system MPI is discoverable.
+elif get_option('with-mpi').disabled()
+  mpi_dep = []
 # Otherwise they are automatically determined
 else
   mpi_dep = [dependency('mpi', language:'c', required : get_option('with-mpi')),
