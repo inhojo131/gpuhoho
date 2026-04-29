@@ -101,6 +101,25 @@ CSysSolve<ScalarType>::CSysSolve(LINEAR_SOLVER_MODE linear_solver_mode)
       LinSysRes_ptr(nullptr) {}
 
 template <class ScalarType>
+CSysSolve<ScalarType>::~CSysSolve() {
+  ResetAMGXCache();
+}
+
+template <class ScalarType>
+void CSysSolve<ScalarType>::ResetAMGXCache() const {
+#ifdef HAVE_AMGX
+  auto& cache = amgx_cache;
+  if (cache.solver) AMGX_SAFE_CALL(AMGX_solver_destroy(reinterpret_cast<AMGX_solver_handle>(cache.solver)));
+  if (cache.sol) AMGX_SAFE_CALL(AMGX_vector_destroy(reinterpret_cast<AMGX_vector_handle>(cache.sol)));
+  if (cache.rhs) AMGX_SAFE_CALL(AMGX_vector_destroy(reinterpret_cast<AMGX_vector_handle>(cache.rhs)));
+  if (cache.matrix) AMGX_SAFE_CALL(AMGX_matrix_destroy(reinterpret_cast<AMGX_matrix_handle>(cache.matrix)));
+  if (cache.rsrc) AMGX_SAFE_CALL(AMGX_resources_destroy(reinterpret_cast<AMGX_resources_handle>(cache.rsrc)));
+  if (cache.cfg) AMGX_SAFE_CALL(AMGX_config_destroy(reinterpret_cast<AMGX_config_handle>(cache.cfg)));
+#endif
+  amgx_cache = AMGXCache{};
+}
+
+template <class ScalarType>
 void CSysSolve<ScalarType>::ApplyGivens(ScalarType s, ScalarType c, ScalarType& h1, ScalarType& h2) const {
   ScalarType temp = c * h1 + s * h2;
   h2 = c * h2 - s * h1;
@@ -807,9 +826,11 @@ unsigned long CSysSolve<ScalarType>::BCGSTAB_LinSolver_GPU(const CSysVector<Scal
 
   b.HtDTransfer();
   x.HtDTransfer();
+  Jacobian.HtDTransfer();
+  Jacobian.JacobiPreconditionerHtDTransfer();
 
   if (!xIsZero) {
-    Jacobian.GPUMatrixVectorProduct(x, A_x, geometry, config, false);
+    Jacobian.GPUMatrixVectorProduct(x, A_x, geometry, config, false, false);
     r.GPUCopyFrom(b);
     r.GPUAXPY(ScalarType(-1), A_x);
   } else {
@@ -834,8 +855,8 @@ unsigned long CSysSolve<ScalarType>::BCGSTAB_LinSolver_GPU(const CSysVector<Scal
     ScalarType beta = (rho / rho_prime) * (alpha / omega);
     p.GPUUpdateP(v, r, beta, omega);
 
-    Jacobian.ComputeJacobiPreconditionerGPU(p, z);
-    Jacobian.GPUMatrixVectorProduct(z, v, geometry, config, false);
+    Jacobian.ComputeJacobiPreconditionerGPU(p, z, false);
+    Jacobian.GPUMatrixVectorProduct(z, v, geometry, config, false, false);
 
     ScalarType r_0_v = r_0.GPUDot(v);
     if (fabs(r_0_v) < eps) break;
@@ -844,8 +865,8 @@ unsigned long CSysSolve<ScalarType>::BCGSTAB_LinSolver_GPU(const CSysVector<Scal
     x.GPUAXPY(alpha, z);
     r.GPUAXPY(-alpha, v);
 
-    Jacobian.ComputeJacobiPreconditionerGPU(r, z);
-    Jacobian.GPUMatrixVectorProduct(z, A_x, geometry, config, false);
+    Jacobian.ComputeJacobiPreconditionerGPU(r, z, false);
+    Jacobian.GPUMatrixVectorProduct(z, A_x, geometry, config, false, false);
 
     ScalarType A_x_sq = A_x.GPUDot(A_x);
     if (A_x_sq == ScalarType(0)) break;
@@ -908,39 +929,87 @@ unsigned long CSysSolve<ScalarType>::AMGX_LinSolver(const CSysVector<ScalarType>
 
   std::ostringstream cfg_stream;
   cfg_stream << "config_version=2, "
+             << "block_format=ROW_MAJOR, "
              << "solver(main)=FGMRES, "
              << "main:preconditioner(amg)=AMG, "
+             << "main:gmres_n_restart=10, "
              << "main:max_iters=" << m << ", "
              << "main:tolerance=" << tol << ", "
-             << "main:monitor_residual=0, "
+             << "main:convergence=RELATIVE_INI, "
+             << "main:norm=L2, "
+             << "main:use_scalar_norm=1, "
+             << "main:monitor_residual=1, "
              << "main:print_solve_stats=0, "
              << "amg:algorithm=AGGREGATION, "
              << "amg:max_iters=1, "
-             << "amg:presweeps=1, "
-             << "amg:postsweeps=1, "
-             << "amg:selector=SIZE_2";
+             << "amg:presweeps=0, "
+             << "amg:postsweeps=3, "
+             << "amg:selector=SIZE_2, "
+             << "amg:cycle=V, "
+             << "amg:smoother=MULTICOLOR_DILU, "
+             << "amg:error_scaling=0, "
+             << "amg:max_levels=50, "
+             << "amg:coarseAgenerator=LOW_DEG, "
+             << "amg:matrix_coloring_scheme=PARALLEL_GREEDY, "
+             << "amg:max_uncolored_percentage=0.05, "
+             << "amg:relaxation_factor=0.75, "
+             << "amg:coarse_solver=DENSE_LU_SOLVER, "
+             << "amg:min_coarse_rows=32";
 
-  AMGX_config_handle cfg_handle;
-  AMGX_resources_handle rsrc_handle;
-  AMGX_matrix_handle A_handle;
-  AMGX_vector_handle b_handle, x_handle;
-  AMGX_solver_handle solver_handle;
   static const AMGXRuntime amgx_runtime;
   (void)amgx_runtime;
 
-  AMGX_SAFE_CALL(AMGX_config_create(&cfg_handle, cfg_stream.str().c_str()));
-  AMGX_SAFE_CALL(AMGX_resources_create_simple(&rsrc_handle, cfg_handle));
-  AMGX_SAFE_CALL(AMGX_matrix_create(&A_handle, rsrc_handle, mode));
-  AMGX_SAFE_CALL(AMGX_vector_create(&b_handle, rsrc_handle, mode));
-  AMGX_SAFE_CALL(AMGX_vector_create(&x_handle, rsrc_handle, mode));
-  AMGX_SAFE_CALL(AMGX_solver_create(&solver_handle, rsrc_handle, mode, cfg_handle));
+  auto& cache = amgx_cache;
+  const bool cache_matches = cache.cfg && cache.n == n && cache.nnz == nnz && cache.block_dimx == block_dimx &&
+                             cache.block_dimy == block_dimy && cache.max_iters == m && cache.tol == tol;
 
-  AMGX_SAFE_CALL(
-      AMGX_matrix_upload_all(A_handle, n, nnz, block_dimx, block_dimy, row_ptr.data(), col_ind.data(), values, nullptr));
+  if (!cache_matches) {
+    ResetAMGXCache();
+
+    AMGX_config_handle cfg_handle;
+    AMGX_resources_handle rsrc_handle;
+    AMGX_matrix_handle A_handle;
+    AMGX_vector_handle b_handle, x_handle;
+    AMGX_solver_handle solver_handle;
+
+    AMGX_SAFE_CALL(AMGX_config_create(&cfg_handle, cfg_stream.str().c_str()));
+    AMGX_SAFE_CALL(AMGX_resources_create_simple(&rsrc_handle, cfg_handle));
+    AMGX_SAFE_CALL(AMGX_matrix_create(&A_handle, rsrc_handle, mode));
+    AMGX_SAFE_CALL(AMGX_vector_create(&b_handle, rsrc_handle, mode));
+    AMGX_SAFE_CALL(AMGX_vector_create(&x_handle, rsrc_handle, mode));
+    AMGX_SAFE_CALL(AMGX_solver_create(&solver_handle, rsrc_handle, mode, cfg_handle));
+
+    cache.cfg = cfg_handle;
+    cache.rsrc = rsrc_handle;
+    cache.matrix = A_handle;
+    cache.rhs = b_handle;
+    cache.sol = x_handle;
+    cache.solver = solver_handle;
+    cache.n = n;
+    cache.nnz = nnz;
+    cache.block_dimx = block_dimx;
+    cache.block_dimy = block_dimy;
+    cache.max_iters = m;
+    cache.tol = tol;
+  }
+
+  auto A_handle = reinterpret_cast<AMGX_matrix_handle>(cache.matrix);
+  auto b_handle = reinterpret_cast<AMGX_vector_handle>(cache.rhs);
+  auto x_handle = reinterpret_cast<AMGX_vector_handle>(cache.sol);
+  auto solver_handle = reinterpret_cast<AMGX_solver_handle>(cache.solver);
+
+  if (!cache.matrix_uploaded) {
+    AMGX_SAFE_CALL(AMGX_matrix_upload_all(A_handle, n, nnz, block_dimx, block_dimy, row_ptr.data(), col_ind.data(),
+                                          values, nullptr));
+    AMGX_SAFE_CALL(AMGX_solver_setup(solver_handle, A_handle));
+    cache.matrix_uploaded = true;
+  } else {
+    AMGX_SAFE_CALL(AMGX_matrix_replace_coefficients(A_handle, n, nnz, values, nullptr));
+    AMGX_SAFE_CALL(AMGX_solver_resetup(solver_handle, A_handle));
+  }
   AMGX_SAFE_CALL(AMGX_vector_upload(b_handle, n, block_dimy, rhs_ptr));
   AMGX_SAFE_CALL(AMGX_vector_upload(x_handle, n, block_dimx, &x[0]));
 
-  AMGX_SAFE_CALL(AMGX_solver_setup(solver_handle, A_handle));
   AMGX_SAFE_CALL(AMGX_solver_solve(solver_handle, b_handle, x_handle));
   AMGX_SAFE_CALL(AMGX_vector_download(x_handle, &x[0]));
 
@@ -948,13 +1017,6 @@ unsigned long CSysSolve<ScalarType>::AMGX_LinSolver(const CSysVector<ScalarType>
   AMGX_SAFE_CALL(AMGX_solver_get_status(solver_handle, &status));
   int num_iters = 0;
   AMGX_SAFE_CALL(AMGX_solver_get_iterations_number(solver_handle, &num_iters));
-
-  AMGX_SAFE_CALL(AMGX_solver_destroy(solver_handle));
-  AMGX_SAFE_CALL(AMGX_vector_destroy(x_handle));
-  AMGX_SAFE_CALL(AMGX_vector_destroy(b_handle));
-  AMGX_SAFE_CALL(AMGX_matrix_destroy(A_handle));
-  AMGX_SAFE_CALL(AMGX_resources_destroy(rsrc_handle));
-  AMGX_SAFE_CALL(AMGX_config_destroy(cfg_handle));
 
   return (status == AMGX_SOLVE_SUCCESS) ? static_cast<unsigned long>(num_iters) : 0ul;
 #else

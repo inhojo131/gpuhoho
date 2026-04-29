@@ -52,6 +52,11 @@ CSysMatrix<ScalarType>::CSysMatrix() : rank(SU2_MPI::GetRank()), size(SU2_MPI::G
   col_ind_ilu = nullptr;
 
   invM = nullptr;
+  d_matrix = nullptr;
+  d_row_ptr = nullptr;
+  d_col_ind = nullptr;
+  d_invM = nullptr;
+  useCuda = false;
 
 #ifdef USE_MKL
   MatrixMatrixProductJitter = nullptr;
@@ -72,6 +77,7 @@ CSysMatrix<ScalarType>::~CSysMatrix() {
     GPUMemoryAllocation::gpu_free(d_matrix);
     GPUMemoryAllocation::gpu_free(d_row_ptr);
     GPUMemoryAllocation::gpu_free(d_col_ind);
+    GPUMemoryAllocation::gpu_free(d_invM);
   }
 
 #ifdef USE_MKL
@@ -185,7 +191,15 @@ void CSysMatrix<ScalarType>::Initialize(unsigned long npoint, unsigned long npoi
 
   if (ilu_needed) allocAndInit(ILU_matrix, nnz_ilu * nVar * nEqn);
 
-  if (diag_needed) allocAndInit(invM, nPointDomain * nVar * nEqn);
+  if (diag_needed) {
+    allocAndInit(invM, nPointDomain * nVar * nEqn);
+    if (useCuda) {
+      auto GPUAllocAndInit = [](ScalarType*& ptr, unsigned long num) {
+        ptr = GPUMemoryAllocation::gpu_alloc<ScalarType, true>(num * sizeof(ScalarType));
+      };
+      GPUAllocAndInit(d_invM, nPointDomain * nVar * nEqn);
+    }
+  }
 
   /*--- Thread parallel initialization. ---*/
 

@@ -79,15 +79,25 @@ void CSysMatrix<ScalarType>::HtDTransfer() const
 }
 
 template<class ScalarType>
+void CSysMatrix<ScalarType>::JacobiPreconditionerHtDTransfer() const
+{
+   if (invM == nullptr || d_invM == nullptr) {
+      return;
+   }
+   gpuErrChk(cudaMemcpy((void*)(d_invM), (void*)invM, (sizeof(ScalarType)*nPointDomain*nVar*nVar), cudaMemcpyHostToDevice));
+}
+
+template<class ScalarType>
 void CSysMatrix<ScalarType>::GPUMatrixVectorProduct(const CSysVector<ScalarType>& vec, CSysVector<ScalarType>& prod,
                                                  CGeometry* geometry, const CConfig* config,
-                                                 bool copy_vec_to_device) const
+                                                 bool copy_vec_to_device,
+                                                 bool copy_matrix_to_device) const
                                                  {
 
    ScalarType* d_vec = vec.GetDevicePointer();
    ScalarType* d_prod = prod.GetDevicePointer();
 
-   HtDTransfer();
+   if (copy_matrix_to_device) HtDTransfer();
    if (copy_vec_to_device) vec.HtDTransfer();
    prod.GPUSetVal(0.0);
 
@@ -102,20 +112,15 @@ void CSysMatrix<ScalarType>::GPUMatrixVectorProduct(const CSysVector<ScalarType>
 
 template<class ScalarType>
 void CSysMatrix<ScalarType>::ComputeJacobiPreconditionerGPU(const CSysVector<ScalarType>& vec,
-                                                            CSysVector<ScalarType>& prod) const {
-   ScalarType* d_invM = nullptr;
-   const size_t invBytes = sizeof(ScalarType) * nPointDomain * nVar * nVar;
-   gpuErrChk(cudaMalloc(reinterpret_cast<void**>(&d_invM), invBytes));
-   gpuErrChk(cudaMemcpy(d_invM, invM, invBytes, cudaMemcpyHostToDevice));
-
+                                                            CSysVector<ScalarType>& prod,
+                                                            bool copy_invM_to_device) const {
+   if (copy_invM_to_device) JacobiPreconditionerHtDTransfer();
    prod.GPUSetVal(0.0);
 
    const int block = 256;
    const int grid = KernelParameters::round_up_division(block, static_cast<int>(nPointDomain));
    GPUJacobiApply<<<grid, block>>>(d_invM, vec.GetDevicePointer(), prod.GetDevicePointer(), nPointDomain, nVar);
    gpuErrChk(cudaPeekAtLastError());
-
-   gpuErrChk(cudaFree(d_invM));
 }
 
 template class CSysMatrix<su2mixedfloat>; //This is a temporary fix for invalid instantiations due to separating the member function from the header file the class is defined in. Will try to rectify it in coming commits.

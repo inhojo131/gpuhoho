@@ -116,6 +116,26 @@ class CSysSolve {
   bool recomputeRes = false;         /*!< \brief Recompute the residual after inner iterations, if monitoring. */
   unsigned long monitorFreq = 10;    /*!< \brief Monitoring frequency. */
 
+  struct AMGXCache {
+    void* cfg = nullptr;
+    void* rsrc = nullptr;
+    void* matrix = nullptr;
+    void* rhs = nullptr;
+    void* sol = nullptr;
+    void* solver = nullptr;
+    int n = 0;
+    int nnz = 0;
+    int block_dimx = 0;
+    int block_dimy = 0;
+    unsigned long max_iters = 0;
+    ScalarType tol = ScalarType(0);
+    bool matrix_uploaded = false;
+  };
+
+  mutable AMGXCache amgx_cache; /*!< \brief Reusable AmgX handles for repeated linear solves. */
+
+  void ResetAMGXCache() const;
+
   /*!
    * \brief sign transfer function
    * \param[in] x - value having sign prescribed
@@ -295,6 +315,9 @@ class CSysSolve {
    * \param[in] linear_solver_mode - enum, to let CSysSolve know in what context it is
    */
   CSysSolve(LINEAR_SOLVER_MODE linear_solver_mode = LINEAR_SOLVER_MODE::STANDARD);
+
+  /*! \brief Destructor. */
+  ~CSysSolve();
 
   /*! \brief Conjugate Gradient method
    * \param[in] b - the right hand size vector

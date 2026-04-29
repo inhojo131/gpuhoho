@@ -148,6 +148,7 @@ class CSysMatrix {
   ScalarType* d_matrix;           /*!< \brief Device Pointer to store the matrix values on the GPU. */
   const unsigned long* d_row_ptr; /*!< \brief Device Pointers to the first element in each row. */
   const unsigned long* d_col_ind; /*!< \brief Device Column index for each of the elements in val(). */
+  ScalarType* d_invM;             /*!< \brief Device pointer to the Jacobi inverse diagonal. */
   bool useCuda;                   /*!< \brief Boolean that indicates whether user has enabled CUDA or not.
                                      Mainly used to conditionally free GPU memory in the class destructor. */
 
@@ -401,6 +402,11 @@ class CSysMatrix {
    * \brief Performs the memory copy from host to device.
    */
   void HtDTransfer() const;
+
+  /*!
+   * \brief Performs the Jacobi inverse diagonal copy from host to device.
+   */
+  void JacobiPreconditionerHtDTransfer() const;
 
   /*!
    * \brief Raw sparse matrix accessors, primarily for external linear solver wrappers.
@@ -883,7 +889,8 @@ class CSysMatrix {
    * \param[out] prod - Result of the product.
    */
   void GPUMatrixVectorProduct(const CSysVector<ScalarType>& vec, CSysVector<ScalarType>& prod, CGeometry* geometry,
-                              const CConfig* config, bool copy_vec_to_device = true) const;
+                              const CConfig* config, bool copy_vec_to_device = true,
+                              bool copy_matrix_to_device = true) const;
 
   /*!
    * \brief Performs first step of the LU_SGS Preconditioner building
@@ -936,7 +943,8 @@ class CSysMatrix {
   /*!
    * \brief Multiply CSysVector by the Jacobi preconditioner on the GPU.
    */
-  void ComputeJacobiPreconditionerGPU(const CSysVector<ScalarType>& vec, CSysVector<ScalarType>& prod) const;
+  void ComputeJacobiPreconditionerGPU(const CSysVector<ScalarType>& vec, CSysVector<ScalarType>& prod,
+                                      bool copy_invM_to_device = true) const;
 
   /*!
    * \brief Build the ILU preconditioner.
