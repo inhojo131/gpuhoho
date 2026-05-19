@@ -35,7 +35,9 @@
 #include "../../include/linear_algebra/CPreconditioner.hpp"
 
 #include <limits>
+#include <cstdlib>
 #include <sstream>
+#include <string>
 
 #ifdef HAVE_AMGX
 #include <amgx_c.h>
@@ -906,19 +908,45 @@ unsigned long CSysSolve<ScalarType>::AMGX_LinSolver(const CSysVector<ScalarType>
 
   const auto mode = AMGXMode<ScalarType>();
 
+  std::string amgx_preset = "AMG_DILU";
+  if (const char* env = std::getenv("SU2_AMGX_PRESET")) {
+    if (env[0] != '\0') amgx_preset = env;
+  }
+  const bool amgx_uses_amg = (amgx_preset != "PBICGSTAB_NOPREC" && amgx_preset != "FGMRES_NOPREC" &&
+                              amgx_preset != "BLOCK_JACOBI");
+
   std::ostringstream cfg_stream;
   cfg_stream << "config_version=2, "
-             << "solver(main)=FGMRES, "
-             << "main:preconditioner(amg)=AMG, "
+             << "block_format=ROW_MAJOR, "
+             << "solver(main)=" << ((amgx_preset == "FGMRES_NOPREC") ? "FGMRES" :
+                                    (amgx_preset == "BLOCK_JACOBI") ? "BLOCK_JACOBI" : "PBICGSTAB") << ", "
+             << "main:preconditioner(amg)=" << (amgx_uses_amg ? "AMG" : "NOSOLVER") << ", "
              << "main:max_iters=" << m << ", "
              << "main:tolerance=" << tol << ", "
+             << "main:convergence=RELATIVE_INI, "
+             << "main:norm=L2, "
+             << "main:use_scalar_norm=1, "
              << "main:monitor_residual=0, "
-             << "main:print_solve_stats=0, "
-             << "amg:algorithm=AGGREGATION, "
-             << "amg:max_iters=1, "
-             << "amg:presweeps=1, "
-             << "amg:postsweeps=1, "
-             << "amg:selector=SIZE_2";
+             << "main:print_solve_stats=0";
+
+  if (amgx_uses_amg) {
+    cfg_stream << ", "
+               << "amg:algorithm=AGGREGATION, "
+               << "amg:max_iters=1, "
+               << "amg:presweeps=" << ((amgx_preset == "AMG_BJ") ? 1 : 0) << ", "
+               << "amg:postsweeps=" << ((amgx_preset == "AMG_BJ") ? 1 : 3) << ", "
+               << "amg:selector=SIZE_2, "
+               << "amg:cycle=V, "
+               << "amg:smoother=" << ((amgx_preset == "AMG_BJ") ? "BLOCK_JACOBI" : "MULTICOLOR_DILU") << ", "
+               << "amg:error_scaling=0, "
+               << "amg:max_levels=50, "
+               << "amg:coarseAgenerator=LOW_DEG, "
+               << "amg:matrix_coloring_scheme=PARALLEL_GREEDY, "
+               << "amg:max_uncolored_percentage=0.05, "
+               << "amg:relaxation_factor=" << ((amgx_preset == "AMG_BJ") ? 0.9 : 0.75) << ", "
+               << "amg:coarse_solver=DENSE_LU_SOLVER, "
+               << "amg:min_coarse_rows=32";
+  }
 
   AMGX_config_handle cfg_handle;
   AMGX_resources_handle rsrc_handle;

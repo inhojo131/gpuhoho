@@ -54,10 +54,35 @@ __global__ void GPUMatrixVectorProductAdd(matrixType* matrix, vectorType* vec, v
    }
 }
 
+template<typename matrixType, typename vectorType>
+__global__ void GPUMatrixVectorProductBlockRow(matrixType* matrix, vectorType* vec, vectorType* prod,
+                                               const unsigned long* d_row_ptr, const unsigned long* d_col_ind,
+                                               unsigned long nPointDomain, unsigned long nVar, unsigned long nEqn)
+{
+   const unsigned long row = blockIdx.x * blockDim.x + threadIdx.x;
+   if (row >= nPointDomain) return;
+
+   for (unsigned long iVar = 0; iVar < nVar; ++iVar) {
+      vectorType sum = 0.0;
+
+      for (unsigned long blockNo = d_row_ptr[row]; blockNo < d_row_ptr[row + 1]; ++blockNo) {
+         const matrixType* block = matrix + blockNo * nVar * nEqn;
+         const vectorType* in = vec + d_col_ind[blockNo] * nEqn;
+
+         for (unsigned long jVar = 0; jVar < nEqn; ++jVar) {
+            sum += block[iVar * nEqn + jVar] * in[jVar];
+         }
+      }
+
+      prod[row * nVar + iVar] = sum;
+   }
+}
+
 template<typename scalarType>
 __global__ void GPUJacobiApply(const scalarType* invM, const scalarType* vec, scalarType* prod,
                                unsigned long nPointDomain, unsigned long nVar) {
    unsigned long iPoint = blockIdx.x * blockDim.x + threadIdx.x;
+   if (iPoint >= nPointDomain) return;
 
    const scalarType* block = invM + iPoint * nVar * nVar;
    const scalarType* in = vec + iPoint * nVar;
@@ -91,11 +116,11 @@ void CSysMatrix<ScalarType>::GPUMatrixVectorProduct(const CSysVector<ScalarType>
    if (copy_vec_to_device) vec.HtDTransfer();
    prod.GPUSetVal(0.0);
 
-  dim3 blockDim(KernelParameters::MVP_BLOCK_SIZE,1,1);
-  int gridx = KernelParameters::round_up_division(KernelParameters::MVP_WARP_SIZE, nPointDomain);
+  dim3 blockDim(128,1,1);
+  int gridx = KernelParameters::round_up_division(128, static_cast<int>(nPointDomain));
   dim3 gridDim(gridx, 1, 1);
 
-  GPUMatrixVectorProductAdd<<<gridDim, blockDim>>>(d_matrix, d_vec, d_prod, d_row_ptr, d_col_ind, nPointDomain, nVar, nEqn);
+  GPUMatrixVectorProductBlockRow<<<gridDim, blockDim>>>(d_matrix, d_vec, d_prod, d_row_ptr, d_col_ind, nPointDomain, nVar, nEqn);
   gpuErrChk( cudaPeekAtLastError() );
 
 }

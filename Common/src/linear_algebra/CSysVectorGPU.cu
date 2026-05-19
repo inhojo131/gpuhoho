@@ -132,12 +132,13 @@ void CSysVector<ScalarType>::GPUUpdateP(const CSysVector<ScalarType>& v, const C
 template<class ScalarType>
 ScalarType CSysVector<ScalarType>::GPUDot(const CSysVector<ScalarType>& x) const {
    const int block = 256;
-   const int grid = std::min(1024, KernelParameters::round_up_division(block, static_cast<int>(nElm)));
+   const unsigned long nDot = nElmDomain;
+   const int grid = std::min(1024, KernelParameters::round_up_division(block, static_cast<int>(nDot)));
 
    ScalarType* d_partial = nullptr;
    gpuErrChk(cudaMalloc(reinterpret_cast<void**>(&d_partial), grid * sizeof(ScalarType)));
 
-   DotPartialKernel<<<grid, block>>>(d_vec_val, x.GetDevicePointer(), d_partial, nElm);
+   DotPartialKernel<<<grid, block>>>(d_vec_val, x.GetDevicePointer(), d_partial, nDot);
    gpuErrChk(cudaPeekAtLastError());
 
    std::vector<ScalarType> h_partial(grid, ScalarType(0));
